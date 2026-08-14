@@ -1,430 +1,524 @@
 <script lang="ts">
-	import { v4 as uuidv4 } from 'uuid';
+	import { getModels, getTaskConfig, updateTaskConfig } from '$lib/apis';
+	import { getChatConfig, updateChatConfig } from '$lib/apis/chats';
+	import { createEventDispatcher, onMount, getContext } from 'svelte';
 	import { toast } from 'svelte-sonner';
 
-	import { getBackendConfig, getTaskConfig, updateTaskConfig } from '$lib/apis';
-	import { setDefaultPromptSuggestions } from '$lib/apis/configs';
-	import { config, models, settings, user } from '$lib/stores';
-	import { createEventDispatcher, onMount, getContext } from 'svelte';
+	import { getBaseModels } from '$lib/apis/models';
 
-	import { banners as _banners } from '$lib/stores';
-	import type { Banner } from '$lib/types';
-
-	import { getBanners, setBanners } from '$lib/apis/configs';
-
-	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import Switch from '$lib/components/common/Switch.svelte';
 	import Textarea from '$lib/components/common/Textarea.svelte';
+	import Spinner from '$lib/components/common/Spinner.svelte';
+	import SettingsSelect from '$lib/components/common/SettingsSelect.svelte';
+	import AdminSettingField from './AdminSettingField.svelte';
+	import AdminSettingRow from './AdminSettingRow.svelte';
+	import AdminSettingSection from './AdminSettingSection.svelte';
+	import { config as appConfig } from '$lib/stores';
 
 	const dispatch = createEventDispatcher();
 
-	const i18n = getContext('i18n');
+	const i18n: any = getContext('i18n');
 
 	let taskConfig = {
 		TASK_MODEL: '',
 		TASK_MODEL_EXTERNAL: '',
+		ENABLE_TITLE_GENERATION: true,
 		TITLE_GENERATION_PROMPT_TEMPLATE: '',
+		ENABLE_FOLLOW_UP_GENERATION: true,
+		FOLLOW_UP_GENERATION_PROMPT_TEMPLATE: '',
+		IMAGE_PROMPT_GENERATION_PROMPT_TEMPLATE: '',
 		ENABLE_AUTOCOMPLETE_GENERATION: true,
 		AUTOCOMPLETE_GENERATION_INPUT_MAX_LENGTH: -1,
+		AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE: '',
 		TAGS_GENERATION_PROMPT_TEMPLATE: '',
 		ENABLE_TAGS_GENERATION: true,
 		ENABLE_SEARCH_QUERY_GENERATION: true,
 		ENABLE_RETRIEVAL_QUERY_GENERATION: true,
-		QUERY_GENERATION_PROMPT_TEMPLATE: ''
+		QUERY_GENERATION_PROMPT_TEMPLATE: '',
+		TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE: '',
+		ENABLE_VOICE_MODE_PROMPT: true,
+		VOICE_MODE_PROMPT_TEMPLATE: ''
 	};
 
-	let promptSuggestions = [];
-	let banners: Banner[] = [];
+	let chatConfig = {
+		CONTEXT_COMPACTION_MODEL: '',
+		ENABLE_CONTEXT_COMPACTION: false,
+		CONTEXT_COMPACTION_TOKEN_THRESHOLD: 80000,
+		CONTEXT_COMPACTION_TOKEN_CAP: 80000,
+		CONTEXT_COMPACTION_RETENTION_PERCENTAGE: 40,
+		CONTEXT_COMPACTION_PROMPT_TEMPLATE: ''
+	};
 
 	const updateInterfaceHandler = async () => {
-		taskConfig = await updateTaskConfig(localStorage.token, taskConfig);
+		[taskConfig, chatConfig] = await Promise.all([
+			updateTaskConfig(localStorage.token, taskConfig),
+			updateChatConfig(localStorage.token, chatConfig)
+		]);
+		appConfig.update((current) =>
+			current
+				? {
+						...current,
+						features: {
+							...current.features,
+							enable_context_compaction: chatConfig.ENABLE_CONTEXT_COMPACTION
+						}
+					}
+				: current
+		);
+	};
 
-		promptSuggestions = await setDefaultPromptSuggestions(localStorage.token, promptSuggestions);
-		await updateBanners();
+	let workspaceModels: any[] = [];
+	let baseModels: any[] = [];
 
-		await config.set(await getBackendConfig());
+	let models: any[] | null = null;
+	$: modelOptions = models ?? [];
+	const normalizeModelSelection = (modelId: string | null | undefined) => {
+		if (!modelId) {
+			return '';
+		}
+
+		const model = modelOptions.find((m: any) => m.id === modelId);
+		if (!model) {
+			return '';
+		}
+
+		if (
+			model?.access_grants &&
+			!model.access_grants.some(
+				(g: any) => g.principal_type === 'user' && g.principal_id === '*' && g.permission === 'read'
+			)
+		) {
+			toast.error($i18n.t('This model is not publicly available. Please select another model.'));
+		}
+
+		return model.id;
+	};
+	const inputClass =
+		'w-full h-7 rounded-lg border border-gray-100/50 bg-gray-50/40 px-2 text-xs text-gray-700 outline-hidden transition-colors placeholder:text-gray-300 focus:border-blue-400 dark:border-white/[0.04] dark:bg-white/[0.03] dark:text-gray-300 dark:placeholder:text-gray-700 dark:focus:border-blue-500';
+	const textareaClass =
+		'w-full rounded-lg border border-gray-100/50 bg-gray-50/40 px-2 py-1.5 text-xs text-gray-700 outline-hidden transition-colors placeholder:text-gray-300 focus:border-blue-400 dark:border-white/[0.04] dark:bg-white/[0.03] dark:text-gray-300 dark:placeholder:text-gray-700 dark:focus:border-blue-500';
+
+	const init = async () => {
+		try {
+			[taskConfig, chatConfig] = await Promise.all([
+				getTaskConfig(localStorage.token),
+				getChatConfig(localStorage.token)
+			]);
+
+			workspaceModels = await getBaseModels(localStorage.token);
+			baseModels = await getModels(localStorage.token, null, false);
+
+			models = baseModels.map((m: any) => {
+				const workspaceModel = workspaceModels.find((wm: any) => wm.id === m.id);
+
+				if (workspaceModel) {
+					return {
+						...m,
+						...workspaceModel
+					};
+				} else {
+					return {
+						...m,
+						id: m.id,
+						name: m.name,
+
+						is_active: true
+					};
+				}
+			});
+
+			console.debug('models', models);
+		} catch (err) {
+			const error = err as { detail?: string; message?: string };
+			console.error('Failed to initialize Interface settings:', err);
+			toast.error(error?.detail ?? error?.message ?? $i18n.t('Failed to load Interface settings'));
+			models = [];
+		}
 	};
 
 	onMount(async () => {
-		taskConfig = await getTaskConfig(localStorage.token);
-
-		promptSuggestions = $config?.default_prompt_suggestions;
-		banners = await getBanners(localStorage.token);
+		await init();
 	});
-
-	const updateBanners = async () => {
-		_banners.set(await setBanners(localStorage.token, banners));
-	};
 </script>
 
-{#if taskConfig}
+{#if models !== null && taskConfig && chatConfig}
 	<form
-		class="flex flex-col h-full justify-between space-y-3 text-sm"
+		class="flex h-full flex-col justify-between text-sm"
 		on:submit|preventDefault={() => {
 			updateInterfaceHandler();
 			dispatch('save');
 		}}
 	>
-		<div class="  overflow-y-scroll scrollbar-hidden h-full pr-1.5">
-			<div>
-				<div class=" mb-2.5 text-sm font-medium flex items-center">
-					<div class=" mr-1">{$i18n.t('Set Task Model')}</div>
-					<Tooltip
-						content={$i18n.t(
-							'A task model is used when performing tasks such as generating titles for chats and web search queries'
+		<h2 class="text-sm font-medium text-gray-900 dark:text-white mb-4">
+			{$i18n.t('Interface')}
+		</h2>
+
+		<div class="flex-1 min-h-0 overflow-y-auto scrollbar-hover pr-1.5">
+			<AdminSettingSection title={$i18n.t('Tasks')} first>
+				<div>
+					<div class="mb-2">
+						<div class="text-xs text-gray-600 dark:text-gray-400">{$i18n.t('Task Model')}</div>
+						<div class="mt-1.5 text-[0.6875rem] text-gray-400 dark:text-gray-600">
+							{$i18n.t(
+								'Choose fallback models for background tasks. Current Model follows the active chat model.'
+							)}
+						</div>
+					</div>
+
+					<div class="grid w-full grid-cols-1 gap-2.5 sm:grid-cols-2">
+						<AdminSettingField label={$i18n.t('Local Task Model')}>
+							<SettingsSelect
+								bind:value={taskConfig.TASK_MODEL}
+								className="w-full"
+								placeholder={$i18n.t('Select a model')}
+								on:change={() => {
+									taskConfig.TASK_MODEL = normalizeModelSelection(taskConfig.TASK_MODEL);
+								}}
+							>
+								<option value="" selected>{$i18n.t('Current Model')}</option>
+								{#each modelOptions as model}
+									<option value={model.id} class="bg-gray-100 dark:bg-gray-700">
+										{model.name}
+										{model?.connection_type === 'local' ? `(${$i18n.t('Local')})` : ''}
+									</option>
+								{/each}
+							</SettingsSelect>
+						</AdminSettingField>
+
+						<AdminSettingField label={$i18n.t('External Task Model')}>
+							<SettingsSelect
+								bind:value={taskConfig.TASK_MODEL_EXTERNAL}
+								className="w-full"
+								placeholder={$i18n.t('Select a model')}
+								on:change={() => {
+									taskConfig.TASK_MODEL_EXTERNAL = normalizeModelSelection(
+										taskConfig.TASK_MODEL_EXTERNAL
+									);
+								}}
+							>
+								<option value="" selected>{$i18n.t('Current Model')}</option>
+								{#each modelOptions as model}
+									<option value={model.id} class="bg-gray-100 dark:bg-gray-700">
+										{model.name}
+										{model?.connection_type === 'local' ? `(${$i18n.t('Local')})` : ''}
+									</option>
+								{/each}
+							</SettingsSelect>
+						</AdminSettingField>
+					</div>
+				</div>
+			</AdminSettingSection>
+
+			<AdminSettingSection title={$i18n.t('Chat')}>
+				<AdminSettingRow
+					label={$i18n.t('Context Compaction')}
+					description={$i18n.t(
+						'Summarize older chat history when the conversation context grows large.'
+					)}
+					let:labelId
+				>
+					<Switch bind:state={chatConfig.ENABLE_CONTEXT_COMPACTION} ariaLabelledbyId={labelId} />
+				</AdminSettingRow>
+
+				{#if chatConfig.ENABLE_CONTEXT_COMPACTION}
+					<AdminSettingField
+						label={$i18n.t('Context Compaction Model')}
+						description={$i18n.t(
+							'Choose a dedicated model for context compaction summaries. Current Model follows the active chat model.'
 						)}
 					>
-						<svg
-							xmlns="http://www.w3.org/2000/svg"
-							fill="none"
-							viewBox="0 0 24 24"
-							stroke-width="1.5"
-							stroke="currentColor"
-							class="size-3.5"
-						>
-							<path
-								stroke-linecap="round"
-								stroke-linejoin="round"
-								d="m11.25 11.25.041-.02a.75.75 0 0 1 1.063.852l-.708 2.836a.75.75 0 0 0 1.063.853l.041-.021M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9-3.75h.008v.008H12V8.25Z"
-							/>
-						</svg>
-					</Tooltip>
-				</div>
-				<div class="flex w-full gap-2">
-					<div class="flex-1">
-						<div class=" text-xs mb-1">{$i18n.t('Local Models')}</div>
-						<select
-							class="w-full rounded-lg py-2 px-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-none"
-							bind:value={taskConfig.TASK_MODEL}
+						<SettingsSelect
+							bind:value={chatConfig.CONTEXT_COMPACTION_MODEL}
+							className="w-full"
 							placeholder={$i18n.t('Select a model')}
+							on:change={() => {
+								chatConfig.CONTEXT_COMPACTION_MODEL = normalizeModelSelection(
+									chatConfig.CONTEXT_COMPACTION_MODEL
+								);
+							}}
 						>
 							<option value="" selected>{$i18n.t('Current Model')}</option>
-							{#each $models.filter((m) => m.owned_by === 'ollama') as model}
+							{#each modelOptions as model}
 								<option value={model.id} class="bg-gray-100 dark:bg-gray-700">
 									{model.name}
+									{model?.connection_type === 'local' ? `(${$i18n.t('Local')})` : ''}
 								</option>
 							{/each}
-						</select>
-					</div>
+						</SettingsSelect>
+					</AdminSettingField>
 
-					<div class="flex-1">
-						<div class=" text-xs mb-1">{$i18n.t('External Models')}</div>
-						<select
-							class="w-full rounded-lg py-2 px-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-none"
-							bind:value={taskConfig.TASK_MODEL_EXTERNAL}
-							placeholder={$i18n.t('Select a model')}
-						>
-							<option value="" selected>{$i18n.t('Current Model')}</option>
-							{#each $models as model}
-								<option value={model.id} class="bg-gray-100 dark:bg-gray-700">
-									{model.name}
-								</option>
-							{/each}
-						</select>
-					</div>
-				</div>
+					<AdminSettingField
+						label={$i18n.t('Token Threshold')}
+						description={$i18n.t(
+							'Older messages are summarized when estimated context exceeds this token limit.'
+						)}
+					>
+						<input
+							type="number"
+							min="1"
+							step="1"
+							class={inputClass}
+							bind:value={chatConfig.CONTEXT_COMPACTION_TOKEN_THRESHOLD}
+						/>
+					</AdminSettingField>
 
-				<div class="mt-3">
-					<div class=" mb-2.5 text-xs font-medium">{$i18n.t('Title Generation Prompt')}</div>
+					<AdminSettingField
+						label={$i18n.t('Token Cap')}
+						description={$i18n.t(
+							'Model-specific context compaction thresholds cannot exceed this token limit.'
+						)}
+					>
+						<input
+							type="number"
+							min="1"
+							step="1"
+							class={inputClass}
+							bind:value={chatConfig.CONTEXT_COMPACTION_TOKEN_CAP}
+						/>
+					</AdminSettingField>
 
-					<Tooltip
-						content={$i18n.t('Leave empty to use the default prompt, or enter a custom prompt')}
-						placement="top-start"
+					<AdminSettingField
+						label={$i18n.t('Retained Messages')}
+						description={$i18n.t(
+							'Percentage of recent messages to keep after older messages are summarized.'
+						)}
+					>
+						<input
+							type="number"
+							min="10"
+							max="50"
+							step="1"
+							class={inputClass}
+							bind:value={chatConfig.CONTEXT_COMPACTION_RETENTION_PERCENTAGE}
+						/>
+					</AdminSettingField>
+
+					<AdminSettingField
+						label={$i18n.t('Context Compaction Prompt')}
+						description={$i18n.t(
+							'Controls how older messages are rewritten into a running summary.'
+						)}
 					>
 						<Textarea
+							className={textareaClass}
+							bind:value={chatConfig.CONTEXT_COMPACTION_PROMPT_TEMPLATE}
+							placeholder={$i18n.t(
+								'Leave empty to use the default prompt, or enter a custom prompt'
+							)}
+						/>
+						<div class="mt-1 text-[0.6875rem] text-gray-400 dark:text-gray-600">
+							{$i18n.t('Available variables')}:
+							<code>{'{{PREVIOUS_SUMMARY}}'}</code>,
+							<code>{'{{COMPACTED_MESSAGES}}'}</code>,
+							<code>{'{{RECENT_MESSAGES}}'}</code>,
+							<code>{'{{MESSAGES}}'}</code>,
+							<code>{'{{CURRENT_DATE}}'}</code>
+						</div>
+					</AdminSettingField>
+				{/if}
+			</AdminSettingSection>
+
+			<AdminSettingSection title={$i18n.t('Generation')}>
+				<AdminSettingRow
+					label={$i18n.t('Title Generation')}
+					description={$i18n.t('Allow automatic names for new chats.')}
+					let:labelId
+				>
+					<Switch bind:state={taskConfig.ENABLE_TITLE_GENERATION} ariaLabelledbyId={labelId} />
+				</AdminSettingRow>
+
+				{#if taskConfig.ENABLE_TITLE_GENERATION}
+					<AdminSettingField
+						label={$i18n.t('Title Generation Prompt')}
+						description={$i18n.t('Shapes the short label generated for each chat.')}
+					>
+						<Textarea
+							className={textareaClass}
 							bind:value={taskConfig.TITLE_GENERATION_PROMPT_TEMPLATE}
 							placeholder={$i18n.t(
 								'Leave empty to use the default prompt, or enter a custom prompt'
 							)}
 						/>
-					</Tooltip>
-				</div>
-
-				<hr class=" border-gray-50 dark:border-gray-850 my-3" />
-
-				<div class="my-3 flex w-full items-center justify-between">
-					<div class=" self-center text-xs font-medium">
-						{$i18n.t('Autocomplete Generation')}
-					</div>
-
-					<Tooltip content={$i18n.t('Enable autocomplete generation for chat messages')}>
-						<Switch bind:state={taskConfig.ENABLE_AUTOCOMPLETE_GENERATION} />
-					</Tooltip>
-				</div>
-
-				{#if taskConfig.ENABLE_AUTOCOMPLETE_GENERATION}
-					<div class="mt-3">
-						<div class=" mb-2.5 text-xs font-medium">
-							{$i18n.t('Autocomplete Generation Input Max Length')}
-						</div>
-
-						<Tooltip
-							content={$i18n.t('Character limit for autocomplete generation input')}
-							placement="top-start"
-						>
-							<input
-								class="w-full outline-none bg-transparent"
-								bind:value={taskConfig.AUTOCOMPLETE_GENERATION_INPUT_MAX_LENGTH}
-								placeholder={$i18n.t('-1 for no limit, or a positive integer for a specific limit')}
-							/>
-						</Tooltip>
-					</div>
+					</AdminSettingField>
 				{/if}
 
-				<hr class=" border-gray-50 dark:border-gray-850 my-3" />
+				<AdminSettingRow
+					label={$i18n.t('Voice Mode Prompt')}
+					description={$i18n.t('Apply voice-specific instructions while voice mode is active.')}
+					let:labelId
+				>
+					<Switch bind:state={taskConfig.ENABLE_VOICE_MODE_PROMPT} ariaLabelledbyId={labelId} />
+				</AdminSettingRow>
 
-				<div class="my-3 flex w-full items-center justify-between">
-					<div class=" self-center text-xs font-medium">
-						{$i18n.t('Tags Generation')}
-					</div>
-
-					<Switch bind:state={taskConfig.ENABLE_TAGS_GENERATION} />
-				</div>
-
-				{#if taskConfig.ENABLE_TAGS_GENERATION}
-					<div class="mt-3">
-						<div class=" mb-2.5 text-xs font-medium">{$i18n.t('Tags Generation Prompt')}</div>
-
-						<Tooltip
-							content={$i18n.t('Leave empty to use the default prompt, or enter a custom prompt')}
-							placement="top-start"
-						>
-							<Textarea
-								bind:value={taskConfig.TAGS_GENERATION_PROMPT_TEMPLATE}
-								placeholder={$i18n.t(
-									'Leave empty to use the default prompt, or enter a custom prompt'
-								)}
-							/>
-						</Tooltip>
-					</div>
-				{/if}
-
-				<hr class=" border-gray-50 dark:border-gray-850 my-3" />
-
-				<div class="my-3 flex w-full items-center justify-between">
-					<div class=" self-center text-xs font-medium">
-						{$i18n.t('Retrieval Query Generation')}
-					</div>
-
-					<Switch bind:state={taskConfig.ENABLE_RETRIEVAL_QUERY_GENERATION} />
-				</div>
-
-				<div class="my-3 flex w-full items-center justify-between">
-					<div class=" self-center text-xs font-medium">
-						{$i18n.t('Web Search Query Generation')}
-					</div>
-
-					<Switch bind:state={taskConfig.ENABLE_SEARCH_QUERY_GENERATION} />
-				</div>
-
-				<div class="">
-					<div class=" mb-2.5 text-xs font-medium">{$i18n.t('Query Generation Prompt')}</div>
-
-					<Tooltip
-						content={$i18n.t('Leave empty to use the default prompt, or enter a custom prompt')}
-						placement="top-start"
+				{#if taskConfig.ENABLE_VOICE_MODE_PROMPT}
+					<AdminSettingField
+						label={$i18n.t('Prompt Template')}
+						description={$i18n.t('Defines the behavior used for spoken conversations.')}
 					>
 						<Textarea
-							bind:value={taskConfig.QUERY_GENERATION_PROMPT_TEMPLATE}
+							className={textareaClass}
+							bind:value={taskConfig.VOICE_MODE_PROMPT_TEMPLATE}
 							placeholder={$i18n.t(
 								'Leave empty to use the default prompt, or enter a custom prompt'
 							)}
 						/>
-					</Tooltip>
-				</div>
-			</div>
+					</AdminSettingField>
+				{/if}
 
-			<hr class=" border-gray-50 dark:border-gray-850 my-3" />
+				<AdminSettingRow
+					label={$i18n.t('Follow Up Generation')}
+					description={$i18n.t('Show suggested next questions after assistant responses.')}
+					let:labelId
+				>
+					<Switch bind:state={taskConfig.ENABLE_FOLLOW_UP_GENERATION} ariaLabelledbyId={labelId} />
+				</AdminSettingRow>
 
-			<div class=" space-y-3 {banners.length > 0 ? ' mb-3' : ''}">
-				<div class="flex w-full justify-between">
-					<div class=" self-center text-sm font-semibold">
-						{$i18n.t('Banners')}
-					</div>
-
-					<button
-						class="p-1 px-3 text-xs flex rounded transition"
-						type="button"
-						on:click={() => {
-							if (banners.length === 0 || banners.at(-1).content !== '') {
-								banners = [
-									...banners,
-									{
-										id: uuidv4(),
-										type: '',
-										title: '',
-										content: '',
-										dismissible: true,
-										timestamp: Math.floor(Date.now() / 1000)
-									}
-								];
-							}
-						}}
+				{#if taskConfig.ENABLE_FOLLOW_UP_GENERATION}
+					<AdminSettingField
+						label={$i18n.t('Follow Up Generation Prompt')}
+						description={$i18n.t('Guides the suggestions shown after an assistant response.')}
 					>
-						<svg
-							xmlns="http://www.w3.org/2000/svg"
-							viewBox="0 0 20 20"
-							fill="currentColor"
-							class="w-4 h-4"
-						>
-							<path
-								d="M10.75 4.75a.75.75 0 00-1.5 0v4.5h-4.5a.75.75 0 000 1.5h4.5v4.5a.75.75 0 001.5 0v-4.5h4.5a.75.75 0 000-1.5h-4.5v-4.5z"
-							/>
-						</svg>
-					</button>
-				</div>
-				<div class="flex flex-col space-y-1">
-					{#each banners as banner, bannerIdx}
-						<div class=" flex justify-between">
-							<div class="flex flex-row flex-1 border rounded-xl dark:border-gray-800">
-								<select
-									class="w-fit capitalize rounded-xl py-2 px-4 text-xs bg-transparent outline-none"
-									bind:value={banner.type}
-									required
-								>
-									{#if banner.type == ''}
-										<option value="" selected disabled class="text-gray-900"
-											>{$i18n.t('Type')}</option
-										>
-									{/if}
-									<option value="info" class="text-gray-900">{$i18n.t('Info')}</option>
-									<option value="warning" class="text-gray-900">{$i18n.t('Warning')}</option>
-									<option value="error" class="text-gray-900">{$i18n.t('Error')}</option>
-									<option value="success" class="text-gray-900">{$i18n.t('Success')}</option>
-								</select>
+						<Textarea
+							className={textareaClass}
+							bind:value={taskConfig.FOLLOW_UP_GENERATION_PROMPT_TEMPLATE}
+							placeholder={$i18n.t(
+								'Leave empty to use the default prompt, or enter a custom prompt'
+							)}
+						/>
+					</AdminSettingField>
+				{/if}
 
-								<input
-									class="pr-5 py-1.5 text-xs w-full bg-transparent outline-none"
-									placeholder={$i18n.t('Content')}
-									bind:value={banner.content}
-								/>
+				<AdminSettingRow
+					label={$i18n.t('Tags Generation')}
+					description={$i18n.t('Create chat tags from conversation content.')}
+					let:labelId
+				>
+					<Switch bind:state={taskConfig.ENABLE_TAGS_GENERATION} ariaLabelledbyId={labelId} />
+				</AdminSettingRow>
 
-								<div class="relative top-1.5 -left-2">
-									<Tooltip content={$i18n.t('Dismissible')} className="flex h-fit items-center">
-										<Switch bind:state={banner.dismissible} />
-									</Tooltip>
-								</div>
-							</div>
+				{#if taskConfig.ENABLE_TAGS_GENERATION}
+					<AdminSettingField
+						label={$i18n.t('Tags Generation Prompt')}
+						description={$i18n.t('Controls how chat tags are inferred.')}
+					>
+						<Textarea
+							className={textareaClass}
+							bind:value={taskConfig.TAGS_GENERATION_PROMPT_TEMPLATE}
+							placeholder={$i18n.t(
+								'Leave empty to use the default prompt, or enter a custom prompt'
+							)}
+						/>
+					</AdminSettingField>
+				{/if}
 
-							<button
-								class="px-2"
-								type="button"
-								on:click={() => {
-									banners.splice(bannerIdx, 1);
-									banners = banners;
-								}}
-							>
-								<svg
-									xmlns="http://www.w3.org/2000/svg"
-									viewBox="0 0 20 20"
-									fill="currentColor"
-									class="w-4 h-4"
-								>
-									<path
-										d="M6.28 5.22a.75.75 0 00-1.06 1.06L8.94 10l-3.72 3.72a.75.75 0 101.06 1.06L10 11.06l3.72 3.72a.75.75 0 101.06-1.06L11.06 10l3.72-3.72a.75.75 0 00-1.06-1.06L10 8.94 6.28 5.22z"
-									/>
-								</svg>
-							</button>
-						</div>
-					{/each}
-				</div>
-			</div>
+				<AdminSettingRow
+					label={$i18n.t('Retrieval Query Generation')}
+					description={$i18n.t('Rewrite user requests for knowledge retrieval.')}
+					let:labelId
+				>
+					<Switch
+						bind:state={taskConfig.ENABLE_RETRIEVAL_QUERY_GENERATION}
+						ariaLabelledbyId={labelId}
+					/>
+				</AdminSettingRow>
 
-			{#if $user.role === 'admin'}
-				<div class=" space-y-3">
-					<div class="flex w-full justify-between mb-2">
-						<div class=" self-center text-sm font-semibold">
-							{$i18n.t('Default Prompt Suggestions')}
-						</div>
+				<AdminSettingRow
+					label={$i18n.t('Web Search Query Generation')}
+					description={$i18n.t('Rewrite user requests into web-search queries.')}
+					let:labelId
+				>
+					<Switch
+						bind:state={taskConfig.ENABLE_SEARCH_QUERY_GENERATION}
+						ariaLabelledbyId={labelId}
+					/>
+				</AdminSettingRow>
 
-						<button
-							class="p-1 px-3 text-xs flex rounded transition"
-							type="button"
-							on:click={() => {
-								if (promptSuggestions.length === 0 || promptSuggestions.at(-1).content !== '') {
-									promptSuggestions = [...promptSuggestions, { content: '', title: ['', ''] }];
-								}
-							}}
-						>
-							<svg
-								xmlns="http://www.w3.org/2000/svg"
-								viewBox="0 0 20 20"
-								fill="currentColor"
-								class="w-4 h-4"
-							>
-								<path
-									d="M10.75 4.75a.75.75 0 00-1.5 0v4.5h-4.5a.75.75 0 000 1.5h4.5v4.5a.75.75 0 001.5 0v-4.5h4.5a.75.75 0 000-1.5h-4.5v-4.5z"
-								/>
-							</svg>
-						</button>
-					</div>
-					<div class="grid lg:grid-cols-2 flex-col gap-1.5">
-						{#each promptSuggestions as prompt, promptIdx}
-							<div
-								class=" flex border border-gray-100 dark:border-none dark:bg-gray-850 rounded-xl py-1.5"
-							>
-								<div class="flex flex-col flex-1 pl-1">
-									<div class="flex border-b border-gray-100 dark:border-gray-800 w-full">
-										<input
-											class="px-3 py-1.5 text-xs w-full bg-transparent outline-none border-r border-gray-100 dark:border-gray-800"
-											placeholder={$i18n.t('Title (e.g. Tell me a fun fact)')}
-											bind:value={prompt.title[0]}
-										/>
+				<AdminSettingField
+					label={$i18n.t('Query Generation Prompt')}
+					description={$i18n.t('Shared prompt for retrieval and web-search query rewriting.')}
+				>
+					<Textarea
+						className={textareaClass}
+						bind:value={taskConfig.QUERY_GENERATION_PROMPT_TEMPLATE}
+						placeholder={$i18n.t('Leave empty to use the default prompt, or enter a custom prompt')}
+					/>
+				</AdminSettingField>
 
-										<input
-											class="px-3 py-1.5 text-xs w-full bg-transparent outline-none border-r border-gray-100 dark:border-gray-800"
-											placeholder={$i18n.t('Subtitle (e.g. about the Roman Empire)')}
-											bind:value={prompt.title[1]}
-										/>
-									</div>
+				<AdminSettingRow
+					label={$i18n.t('Autocomplete Generation')}
+					description={$i18n.t('Suggest completions while users type chat messages.')}
+					let:labelId
+				>
+					<Switch
+						bind:state={taskConfig.ENABLE_AUTOCOMPLETE_GENERATION}
+						ariaLabelledbyId={labelId}
+					/>
+				</AdminSettingRow>
 
-									<textarea
-										class="px-3 py-1.5 text-xs w-full bg-transparent outline-none border-r border-gray-100 dark:border-gray-800 resize-none"
-										placeholder={$i18n.t('Prompt (e.g. Tell me a fun fact about the Roman Empire)')}
-										rows="3"
-										bind:value={prompt.content}
-									/>
-								</div>
+				{#if taskConfig.ENABLE_AUTOCOMPLETE_GENERATION}
+					<AdminSettingField
+						label={$i18n.t('Autocomplete Generation Input Max Length')}
+						description={$i18n.t('Limit how much draft text is sent for suggestion generation.')}
+					>
+						<input
+							type="number"
+							min="-1"
+							step="1"
+							class={inputClass}
+							bind:value={taskConfig.AUTOCOMPLETE_GENERATION_INPUT_MAX_LENGTH}
+							placeholder={$i18n.t('-1 for no limit, or a positive integer for a specific limit')}
+						/>
+					</AdminSettingField>
 
-								<button
-									class="px-3"
-									type="button"
-									on:click={() => {
-										promptSuggestions.splice(promptIdx, 1);
-										promptSuggestions = promptSuggestions;
-									}}
-								>
-									<svg
-										xmlns="http://www.w3.org/2000/svg"
-										viewBox="0 0 20 20"
-										fill="currentColor"
-										class="w-4 h-4"
-									>
-										<path
-											d="M6.28 5.22a.75.75 0 00-1.06 1.06L8.94 10l-3.72 3.72a.75.75 0 101.06 1.06L10 11.06l3.72 3.72a.75.75 0 101.06-1.06L11.06 10l3.72-3.72a.75.75 0 00-1.06-1.06L10 8.94 6.28 5.22z"
-										/>
-									</svg>
-								</button>
-							</div>
-						{/each}
-					</div>
+					<AdminSettingField
+						label={$i18n.t('Autocomplete Generation Prompt')}
+						description={$i18n.t('Guides inline completions while users type a message.')}
+					>
+						<Textarea
+							className={textareaClass}
+							bind:value={taskConfig.AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE}
+							placeholder={$i18n.t(
+								'Leave empty to use the default prompt, or enter a custom prompt'
+							)}
+						/>
+					</AdminSettingField>
+				{/if}
 
-					{#if promptSuggestions.length > 0}
-						<div class="text-xs text-left w-full mt-2">
-							{$i18n.t('Adjusting these settings will apply changes universally to all users.')}
-						</div>
-					{/if}
-				</div>
-			{/if}
+				<AdminSettingField
+					label={$i18n.t('Image Prompt Generation Prompt')}
+					description={$i18n.t('Rewrites user intent into an image-generation prompt.')}
+				>
+					<Textarea
+						className={textareaClass}
+						bind:value={taskConfig.IMAGE_PROMPT_GENERATION_PROMPT_TEMPLATE}
+						placeholder={$i18n.t('Leave empty to use the default prompt, or enter a custom prompt')}
+					/>
+				</AdminSettingField>
+
+				<AdminSettingField
+					label={$i18n.t('Tools Function Calling Prompt')}
+					description={$i18n.t('Guides how the assistant formats tool and function calls.')}
+				>
+					<Textarea
+						className={textareaClass}
+						bind:value={taskConfig.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE}
+						placeholder={$i18n.t('Leave empty to use the default prompt, or enter a custom prompt')}
+					/>
+				</AdminSettingField>
+			</AdminSettingSection>
 		</div>
 
-		<div class="flex justify-end text-sm font-medium">
+		<div class="flex justify-end pt-6 text-sm font-normal">
 			<button
-				class="px-3.5 py-1.5 text-sm font-medium bg-black hover:bg-gray-900 text-white dark:bg-white dark:text-black dark:hover:bg-gray-100 transition rounded-full"
+				class="px-3.5 py-1.5 text-sm font-normal bg-black hover:bg-gray-900 text-white dark:bg-white dark:text-black dark:hover:bg-gray-100 transition rounded-full"
 				type="submit"
 			>
 				{$i18n.t('Save')}
 			</button>
 		</div>
 	</form>
+{:else}
+	<div class="flex h-full w-full items-center justify-center">
+		<Spinner className="size-5" />
+	</div>
 {/if}

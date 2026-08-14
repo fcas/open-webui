@@ -1,10 +1,10 @@
 <script lang="ts">
 	import { v4 as uuidv4 } from 'uuid';
 	import { toast } from 'svelte-sonner';
-	import mermaid from 'mermaid';
 	import { PaneGroup, Pane, PaneResizer } from 'paneforge';
 
 	import { getContext, onDestroy, onMount, tick } from 'svelte';
+	import { fade } from 'svelte/transition';
 	const i18n: Writable<i18nType> = getContext('i18n');
 
 	import { goto } from '$app/navigation';
@@ -13,10 +13,10 @@
 	import { get, type Unsubscriber, type Writable } from 'svelte/store';
 	import type { i18n as i18nType } from 'i18next';
 	import { WEBUI_BASE_URL } from '$lib/constants';
+	import equal from 'fast-deep-equal';
 
 	import {
 		chatId,
-		chats,
 		config,
 		type Model,
 		models,
@@ -27,51 +27,78 @@
 		banners,
 		user,
 		socket,
+		audioQueue,
 		showControls,
 		showCallOverlay,
-		currentChatPage,
 		temporaryChatEnabled,
 		mobile,
-		showOverview,
 		chatTitle,
 		showArtifacts,
-		tools
+		artifactContents,
+		tools,
+		skills,
+		toolServers,
+		terminalServers,
+		functions,
+		selectedFolder,
+		showEmbeds,
+		selectedTerminalId,
+		showFileNavPath,
+		showFileNavDir,
+		chatRequestQueues,
+		desktopEvent
 	} from '$lib/stores';
+	import { refreshChatList, refreshFolderChatLists } from '$lib/stores/chatList';
+
+	import { WEBUI_API_BASE_URL } from '$lib/constants';
+
 	import {
 		convertMessagesToHistory,
 		copyToClipboard,
 		getMessageContentParts,
-		extractSentencesForAudio,
-		promptTemplate,
-		splitStream,
-		sleep
+		createMessagesList,
+		sanitizeHistory,
+		getPromptVariables,
+		processDetails,
+		removeAllDetails,
+		getCodeBlockContents,
+		isYoutubeUrl,
+		displayFileHandler
 	} from '$lib/utils';
+	import { AudioQueue } from '$lib/utils/audio';
+	import { createTemporaryChatId, isTemporaryChatId } from '$lib/utils/chatId';
+	import { getOutputText } from './Messages/structuredOutput';
 
-	import { generateChatCompletion } from '$lib/apis/ollama';
 	import {
-		addTagById,
+		archiveChatById,
+		compactChatById,
 		createNewChat,
-		deleteTagById,
-		deleteTagsById,
+		deleteChatById,
+		forkChatById,
 		getAllTags,
 		getChatById,
-		getChatList,
 		getTagsById,
-		updateChatById
+		updateChatById,
+		updateChatFolderIdById
 	} from '$lib/apis/chats';
 	import { generateOpenAIChatCompletion } from '$lib/apis/openai';
 	import { processWeb, processWebSearch, processYoutubeVideo } from '$lib/apis/retrieval';
-	import { createOpenAITextStream } from '$lib/apis/streaming';
-	import { queryMemory } from '$lib/apis/memories';
 	import { getAndUpdateUserLocation, getUserSettings } from '$lib/apis/users';
 	import {
-		chatCompleted,
 		generateQueries,
 		chatAction,
 		generateMoACompletion,
-		stopTask
+		stopTask,
+		stopTasksByChatId,
+		getTaskIdsByChatId
 	} from '$lib/apis';
 	import { getTools } from '$lib/apis/tools';
+	import { getSkills } from '$lib/apis/skills';
+	import { uploadFile } from '$lib/apis/files';
+	import { createOpenAITextStream } from '$lib/apis/streaming';
+	import { getFunctions } from '$lib/apis/functions';
+	import { initiateOAuthRedirect } from '$lib/apis/configs';
+	import { updateFolderById } from '$lib/apis/folders';
 
 	import Banner from '../common/Banner.svelte';
 	import MessageInput from '$lib/components/chat/MessageInput.svelte';
@@ -79,17 +106,50 @@
 	import Navbar from '$lib/components/chat/Navbar.svelte';
 	import ChatControls from './ChatControls.svelte';
 	import EventConfirmDialog from '../common/ConfirmDialog.svelte';
+	import DeleteConfirmDialog from '../common/ConfirmDialog.svelte';
+	import WebSearchConfirmDialog from '../common/ConfirmDialog.svelte';
 	import Placeholder from './Placeholder.svelte';
+	import FilesOverlay from './MessageInput/FilesOverlay.svelte';
 	import NotificationToast from '../NotificationToast.svelte';
+	import Spinner from '../common/Spinner.svelte';
+	import Modal from '../common/Modal.svelte';
+	import { isEmbedWindow } from '../common/FullHeightIframe.svelte';
+	import Tooltip from '../common/Tooltip.svelte';
+	import Sidebar from '../icons/Sidebar.svelte';
+	import Image from '../common/Image.svelte';
+	import XMark from '../icons/XMark.svelte';
+	import EmbeddedChatHistoryDropdown from './EmbeddedChatHistoryDropdown.svelte';
+	import InputVariablesModal from './MessageInput/InputVariablesModal.svelte';
 
 	export let chatIdProp = '';
+	export let embedded = false;
+	export let embeddedTitle = '';
+	export let embeddedChats = [];
+	export let embeddedDraftKey = '';
+	export let suggestedPrompts = [];
+	export let selectedText = '';
+	export let onInsertToNote: ((content: string) => void) | null = null;
+	export let onCloseEmbedded: (() => void) | null = null;
+	export let onNewEmbeddedChat: (() => void | Promise<void>) | null = null;
+	export let onCreateEmbeddedChat: (() => any | Promise<any>) | null = null;
+	export let onSelectEmbeddedChat: ((chatId: string) => void | Promise<void>) | null = null;
+	export let onDeleteEmbeddedChat: ((chatId: string) => void | Promise<void>) | null = null;
+	export let onEmbeddedChatTitle: ((chatId: string, title: string) => void | Promise<void>) | null =
+		null;
 
-	let loaded = false;
+	let loading = true;
+	$: chatContainerId = embedded ? 'note-chat-container' : 'chat-container';
+	$: messageInputDropzoneId = embedded ? 'note-chat-input-dropzone' : 'chat-pane';
+
 	const eventTarget = new EventTarget();
-	let controlPane;
-	let controlPaneComponent;
+	let controlPane: Pane | undefined;
+	let controlPaneComponent: ChatControls | undefined;
+
+	let messageInput: MessageInput | undefined;
+	let messagesRef: Messages | undefined;
 
 	let autoScroll = true;
+	let isNearTop = true;
 	let processing = '';
 	let messagesContainerElement: HTMLDivElement;
 
@@ -101,106 +161,709 @@
 	let eventConfirmationInput = false;
 	let eventConfirmationInputPlaceholder = '';
 	let eventConfirmationInputValue = '';
+	let eventConfirmationInputType = '';
+	let eventConfirmationInputOptions: ({ label?: string; value: string } | string)[] = [];
 	let eventCallback = null;
-
-	let chatIdUnsubscriber: Unsubscriber | undefined;
 
 	let selectedModels = [''];
 	let atSelectedModel: Model | undefined;
 	let selectedModelIds = [];
-	$: selectedModelIds = atSelectedModel !== undefined ? [atSelectedModel.id] : selectedModels;
+	$: if (atSelectedModel !== undefined) {
+		selectedModelIds = [atSelectedModel.id];
+	} else {
+		selectedModelIds = selectedModels;
+	}
+	let serverContextUsage = null;
+	let contextUsage = null;
+
+	const getAvailableModelIds = () =>
+		$models.filter((m) => !(m?.info?.meta?.hidden ?? false)).map((m) => m.id);
+	const getDefaultModelIds = () =>
+		$config?.default_models ? $config.default_models.split(',') : [];
+	const normalizeSelectedModels = (modelIds: string[] = []) => {
+		const availableModels = getAvailableModelIds();
+		const defaultModels = getDefaultModelIds();
+		let normalized = (modelIds ?? []).filter(
+			(modelId) => modelId && availableModels.includes(modelId)
+		);
+
+		if (normalized.length === 0 && $settings?.models?.length) {
+			normalized = $settings.models.filter((modelId) => availableModels.includes(modelId));
+		}
+		if (normalized.length === 0 && defaultModels.length > 0) {
+			normalized = defaultModels.filter((modelId) => availableModels.includes(modelId));
+		}
+		if (normalized.length === 0) {
+			normalized = availableModels.length > 0 ? [availableModels[0]] : [''];
+		}
+
+		return normalized;
+	};
+
+	$: {
+		const modelSearchParam =
+			$page.url.searchParams.get('models') || $page.url.searchParams.get('model');
+
+		if (
+			chatIdProp === '' &&
+			$models.length > 0 &&
+			!selectedModels?.some((modelId) => modelId) &&
+			!modelSearchParam
+		) {
+			const fallbackModels = normalizeSelectedModels(selectedModels);
+			if (!equal(fallbackModels, selectedModels)) {
+				selectedModels = fallbackModels;
+			}
+		}
+	}
+
+	const estimateTokens = (value) => {
+		if (value === null || value === undefined || value === '') {
+			return 0;
+		}
+		if (typeof value !== 'string') {
+			try {
+				value = JSON.stringify(value);
+			} catch {
+				value = String(value);
+			}
+		}
+		return Math.max(1, Math.floor(value.length / 4));
+	};
+
+	const estimateMessagesTokens = (messages) =>
+		messages.reduce((total, message) => {
+			let next = total + 4 + estimateTokens(message.content);
+			next += estimateTokens(message.output);
+			next += estimateTokens(message.tool_calls);
+			next += estimateTokens(message.files);
+			return next;
+		}, 0);
+
+	$: contextCompactionEnabled = Boolean($config?.features?.enable_context_compaction);
+
+	const getContextThreshold = () => {
+		const chatThreshold = Number(params?.compact_token_threshold);
+		if (Number.isFinite(chatThreshold) && chatThreshold > 0) {
+			return chatThreshold;
+		}
+
+		const modelId = atSelectedModel?.id ?? selectedModels.find((id) => id);
+		const model = $models.find((item) => item.id === modelId);
+		const threshold = Number(model?.info?.params?.compact_token_threshold);
+		return Number.isFinite(threshold) && threshold > 0 ? threshold : null;
+	};
+
+	const getContextUsage = () => {
+		if (!history?.currentId) {
+			return null;
+		}
+
+		const messages = createMessagesList(history, history.currentId);
+		const threshold = contextCompactionEnabled
+			? (getContextThreshold() ?? serverContextUsage?.threshold ?? null)
+			: null;
+		const systemTokens = estimateTokens($settings?.system ?? '');
+		let estimatedTokens = systemTokens;
+		let hasUsageCheckpoint = false;
+		let summary = '';
+		let startIdx = 0;
+
+		for (let idx = 0; idx < messages.length; idx += 1) {
+			const value = messages[idx]?.contextSummary ?? messages[idx]?.context_summary;
+			if (typeof value === 'string' && value.trim()) {
+				summary = value;
+				startIdx = idx;
+			}
+		}
+
+		const activeMessages = messages.slice(startIdx);
+
+		for (let idx = activeMessages.length - 1; idx >= 0; idx -= 1) {
+			const usage = activeMessages[idx]?.usage ?? activeMessages[idx]?.info?.usage;
+			const inputTokens = usage?.input_tokens ?? usage?.prompt_tokens;
+			if (inputTokens) {
+				hasUsageCheckpoint = true;
+				estimatedTokens =
+					Number(inputTokens || 0) +
+					Number(usage.output_tokens ?? usage.completion_tokens ?? 0) +
+					estimateMessagesTokens(activeMessages.slice(idx + 1));
+				break;
+			}
+		}
+
+		if (!hasUsageCheckpoint) {
+			estimatedTokens += estimateTokens(summary) + estimateMessagesTokens(activeMessages);
+		}
+
+		return {
+			tokens: estimatedTokens,
+			estimated_tokens: estimatedTokens,
+			threshold,
+			percent: threshold > 0 ? Math.max(0, Math.round((estimatedTokens / threshold) * 100)) : null,
+			source: 'estimated'
+		};
+	};
+
+	$: contextUsage = getContextUsage() ?? (contextCompactionEnabled ? serverContextUsage : null);
+	$: embeddedHeaderTitle = embeddedTitle || $chatTitle || $i18n.t('Chat');
 
 	let selectedToolIds = [];
+	let selectedSkillIds = [];
+	let selectedFilterIds = [];
+	let pendingOAuthTools = [];
+
+	let imageGenerationEnabled = false;
 	let webSearchEnabled = false;
+	let codeInterpreterEnabled = false;
+	let webSearchActive = false;
+	let showWebSearchConfirm = false;
+	let pendingWebSearchPrompt: string | null = null;
+	let webSearchConfirmed = false;
+
+	$: {
+		const currentModels = atSelectedModel?.id ? [atSelectedModel.id] : selectedModels;
+		const allModelsSupportWebSearch =
+			currentModels.filter(
+				(model) => $models.find((m) => m.id === model)?.info?.meta?.capabilities?.web_search ?? true
+			).length === currentModels.length;
+
+		webSearchActive = Boolean(
+			$config?.features?.enable_web_search &&
+			($user?.role === 'admin' || $user?.permissions?.features?.web_search) &&
+			(webSearchEnabled ||
+				(allModelsSupportWebSearch && ($settings?.webSearch ?? false) === 'always'))
+		);
+	}
+
+	const openWebSearchConfirm = () => {
+		window.setTimeout(() => {
+			showWebSearchConfirm = true;
+		}, 0);
+	};
+
+	const handleWebSearchToggle = (enabled: boolean) => {
+		if (enabled && $config?.features?.enable_web_search_confirmation && !webSearchConfirmed) {
+			webSearchEnabled = false;
+			pendingWebSearchPrompt = null;
+			openWebSearchConfirm();
+		}
+	};
+
+	const resetWebSearchConfirmation = () => {
+		webSearchConfirmed = false;
+		pendingWebSearchPrompt = null;
+		showWebSearchConfirm = false;
+	};
+
+	$: if (!webSearchActive) {
+		resetWebSearchConfirmation();
+	}
+
+	let showCommands = false;
+
+	let generating = false;
+	let dragged = false;
+	let generationController = null;
+	let contextCompactionToastId = null;
 
 	let chat = null;
 	let tags = [];
+
+	// Read-only when viewing someone else's chat (e.g. via shared folder access)
+	$: readOnly = chat != null && chat.user_id !== $user?.id;
+
+	let chatTasks = [];
 
 	let history = {
 		messages: {},
 		currentId: null
 	};
 
-	let taskId = null;
+	let taskIds = null;
 
 	// Chat Input
 	let prompt = '';
 	let chatFiles = [];
 	let files = [];
 	let params = {};
+	let chatVariables = {};
+	let showChatVariablesModal = false;
+	let loadedChatIdProp = '';
+	let currentDraftKey = '';
 
-	$: if (chatIdProp) {
-		(async () => {
-			console.log(chatIdProp);
+	const mergeChatVariableSchemas = (modelIds = [], availableModels = []) => {
+		const byKey: Record<string, any> = {};
+		const conflicts: any[] = [];
 
-			prompt = '';
-			files = [];
-			selectedToolIds = [];
-			webSearchEnabled = false;
+		for (const modelId of modelIds.filter(Boolean)) {
+			const fields =
+				availableModels.find((model) => model.id === modelId)?.info?.meta?.chat_variables_schema
+					?.fields ?? [];
+			for (const rawField of fields) {
+				const field = {
+					...rawField,
+					type: rawField?.type ?? 'text',
+					required: Boolean(rawField?.required)
+				};
+				if (!field?.key) continue;
+				const { required, ...shape } = field;
 
-			loaded = false;
-
-			if (chatIdProp && (await loadChat())) {
-				await tick();
-				loaded = true;
-
-				if (localStorage.getItem(`chat-input-${chatIdProp}`)) {
-					try {
-						const input = JSON.parse(localStorage.getItem(`chat-input-${chatIdProp}`));
-
-						prompt = input.prompt;
-						files = input.files;
-						selectedToolIds = input.selectedToolIds;
-						webSearchEnabled = input.webSearchEnabled;
-					} catch (e) {}
+				const existing = byKey[field.key];
+				if (!existing) {
+					byKey[field.key] = {
+						field,
+						modelIds: [modelId],
+						shape
+					};
+					continue;
 				}
 
-				window.setTimeout(() => scrollToBottom(), 0);
-				const chatInput = document.getElementById('chat-input');
-				chatInput?.focus();
-			} else {
-				await goto('/');
+				if (!equal(existing.shape, shape)) {
+					conflicts.push({
+						key: field.key,
+						modelIds: [...existing.modelIds, modelId]
+					});
+					continue;
+				}
+
+				existing.field = {
+					...existing.field,
+					required: existing.field.required || field.required
+				};
+				existing.modelIds.push(modelId);
 			}
-		})();
+		}
+
+		return {
+			fields: Object.values(byKey).map((item: any) => item.field),
+			conflicts
+		};
+	};
+
+	const hasValue = (value) => value !== undefined && value !== null && value !== '';
+
+	const getChatVariablesForm = (modelIds = [], values = {}, availableModels = []) => {
+		const { fields, conflicts } = mergeChatVariableSchemas(modelIds, availableModels);
+		const empty =
+			fields.length > 0 &&
+			fields.every((field) => !hasValue(values?.[field.key]) && !hasValue(field.default));
+		const missing = fields.some(
+			(field) => field.required && !hasValue(values?.[field.key]) && !hasValue(field.default)
+		);
+		const variables = fields.reduce(
+			(acc, field) => {
+				const { key, ...inputField } = field;
+				acc[key] = {
+					...inputField,
+					default: hasValue(values?.[key]) ? values[key] : inputField.default
+				};
+				return acc;
+			},
+			{} as Record<string, any>
+		);
+
+		return { conflicts, empty, missing, variables };
+	};
+
+	const saveChatVariables = async (values) => {
+		chatVariables = { ...chatVariables, ...values };
+
+		if ($chatId && !$temporaryChatEnabled && !isTemporaryChatId($chatId)) {
+			const res = await updateChatById(localStorage.token, $chatId, {}, chatVariables).catch(
+				(err) => {
+					console.error('[chat variables save]', err);
+					toast.error($i18n.t('Failed to save chat variables'));
+					return null;
+				}
+			);
+			if (res) chat = res;
+		}
+	};
+
+	let oldSelectedModelIds = [''];
+	$: if (!equal(selectedModelIds, oldSelectedModelIds)) {
+		onSelectedModelIdsChange();
 	}
+
+	const onSelectedModelIdsChange = () => {
+		resetInput();
+		oldSelectedModelIds = structuredClone(selectedModelIds);
+	};
+
+	const mergeFiles = (current, incoming) => {
+		const seen = new Set();
+		return [...(incoming ?? []), ...(current ?? [])].filter((file) => {
+			const key = `${file?.type ?? ''}:${file?.id ?? file?.url ?? file?.name ?? ''}`;
+			if (seen.has(key)) return false;
+			seen.add(key);
+			return true;
+		});
+	};
+	const withSelectedText = (text: string) =>
+		embedded && selectedText?.trim()
+			? `${text}\n\nSelected note text for replace_note_content operations:\n${selectedText.trim()}`
+			: text;
+	const noteChatDebug = (message: string, data: Record<string, unknown> = {}) => {
+		if (!embedded) return;
+		console.info('[note-chat]', message, {
+			chatIdProp,
+			activeChatId: $chatId,
+			loading,
+			...data
+		});
+	};
+
+	$: if (chatIdProp && chatIdProp !== loadedChatIdProp) {
+		noteChatDebug('chatIdProp changed; loading linked chat', {
+			previousChatIdProp: loadedChatIdProp
+		});
+		loadedChatIdProp = chatIdProp;
+		navigateHandler();
+	}
+
+	$: if (embedded && embeddedDraftKey && embeddedDraftKey !== currentDraftKey) {
+		noteChatDebug('embedded draft requested', { embeddedDraftKey });
+		currentDraftKey = embeddedDraftKey;
+		initEmbeddedDraft();
+	}
+
+	let saveControlsTimer;
+	$: if (!loading && !$temporaryChatEnabled && $chatId && params && chatFiles) {
+		clearTimeout(saveControlsTimer);
+		saveControlsTimer = setTimeout(saveControls, 400);
+	}
+
+	const navigateHandler = async () => {
+		noteChatDebug('navigateHandler start');
+		// Mark the outgoing chat as read before loading the new one.
+		// $chatId still holds the previous chat here — loadChat() updates it.
+		if ($chatId && $chatId !== chatIdProp && !$temporaryChatEnabled) {
+			noteChatDebug('marking outgoing chat read', { outgoingChatId: $chatId });
+			updateLastReadAt($chatId);
+		}
+
+		clearTimeout(saveControlsTimer);
+		await saveControls();
+		loading = true;
+
+		prompt = '';
+		messageInput?.setText('');
+
+		files = [];
+		selectedToolIds = [];
+		selectedSkillIds = [];
+		selectedFilterIds = [];
+		webSearchEnabled = false;
+		imageGenerationEnabled = false;
+
+		const storageChatInput = sessionStorage.getItem(
+			`chat-input${chatIdProp ? `-${chatIdProp}` : ''}`
+		);
+
+		const loaded = chatIdProp ? await loadChat() : false;
+		noteChatDebug('loadChat completed inside navigateHandler', { loaded });
+		if (loaded) {
+			await tick();
+			loading = false;
+			noteChatDebug('embedded chat loading false');
+			window.setTimeout(() => scrollToBottom(), 0);
+
+			await tick();
+
+			// Mark chat read when initially loading it
+			if (chatIdProp && !$temporaryChatEnabled) {
+				updateLastReadAt(chatIdProp);
+			}
+
+			// Process any queued requests if the chat is idle
+			const lastMessage = history.currentId ? history.messages[history.currentId] : null;
+			const isIdle = !lastMessage || lastMessage.role !== 'assistant' || lastMessage.done;
+			if (isIdle) {
+				await processNextInQueue(chatIdProp);
+			}
+
+			if (storageChatInput) {
+				try {
+					const input = JSON.parse(storageChatInput);
+
+					if (!$temporaryChatEnabled) {
+						messageInput?.setText(input.prompt);
+						files = input.files;
+						selectedToolIds = input.selectedToolIds;
+						selectedSkillIds = input.selectedSkillIds ?? [];
+						selectedFilterIds = input.selectedFilterIds;
+						webSearchEnabled = input.webSearchEnabled;
+						imageGenerationEnabled = input.imageGenerationEnabled;
+						codeInterpreterEnabled = input.codeInterpreterEnabled;
+					}
+				} catch (e) {}
+			} else {
+				await setDefaults();
+			}
+
+			const chatInput = document.getElementById('chat-input');
+			chatInput?.focus();
+		} else if (!embedded) {
+			await goto('/');
+		} else {
+			loading = false;
+			console.warn('[note-chat] embedded load failed; clearing spinner', {
+				chatIdProp,
+				activeChatId: $chatId
+			});
+		}
+	};
+
+	const initEmbeddedDraft = async () => {
+		clearTimeout(saveControlsTimer);
+		await saveControls();
+
+		if ($chatId && !$temporaryChatEnabled) {
+			updateLastReadAt($chatId);
+		}
+
+		loading = true;
+		loadedChatIdProp = '';
+		chat = null;
+		tags = [];
+		taskIds = null;
+		chatTasks = [];
+		serverContextUsage = null;
+		history = {
+			messages: {},
+			currentId: null
+		};
+		params = {};
+		chatVariables = {};
+		chatFiles = [];
+		files = [];
+		selectedToolIds = [];
+		selectedSkillIds = [];
+		selectedFilterIds = [];
+		webSearchEnabled = false;
+		imageGenerationEnabled = false;
+		codeInterpreterEnabled = false;
+		prompt = '';
+		messageInput?.setText('');
+		await chatId.set('');
+		await chatTitle.set('');
+
+		await setDefaults();
+		loading = false;
+		await tick();
+		document.getElementById('chat-input')?.focus();
+	};
+
+	const onSelect = async (e) => {
+		const { type, data } = e;
+
+		if (type === 'prompt') {
+			// Handle prompt selection
+			messageInput?.setText(data, async () => {
+				if (!($settings?.insertSuggestionPrompt ?? false)) {
+					await tick();
+					submitHandler(prompt);
+				}
+			});
+		}
+	};
 
 	$: if (selectedModels && chatIdProp !== '') {
 		saveSessionSelectedModels();
 	}
 
 	const saveSessionSelectedModels = () => {
-		if (selectedModels.length === 0 || (selectedModels.length === 1 && selectedModels[0] === '')) {
+		const selectedModelsString = JSON.stringify(selectedModels);
+		if (
+			selectedModels.length === 0 ||
+			(selectedModels.length === 1 && selectedModels[0] === '') ||
+			sessionStorage.selectedModels === selectedModelsString
+		) {
 			return;
 		}
-		sessionStorage.selectedModels = JSON.stringify(selectedModels);
+		sessionStorage.selectedModels = selectedModelsString;
 		console.log('saveSessionSelectedModels', selectedModels, sessionStorage.selectedModels);
 	};
 
-	$: if (selectedModels) {
-		setToolIds();
-	}
-
-	const setToolIds = async () => {
-		if (!$tools) {
-			tools.set(await getTools(localStorage.token));
-		}
-
-		if (selectedModels.length !== 1) {
+	const continueOAuthRedirect = async () => {
+		if (pendingOAuthTools.length === 0) {
+			sessionStorage.removeItem('oauthRedirectInProgressToolId');
 			return;
 		}
-		const model = $models.find((m) => m.id === selectedModels[0]);
-		if (model) {
-			selectedToolIds = (model?.info?.meta?.toolIds ?? []).filter((id) =>
-				$tools.find((t) => t.id === id)
-			);
+
+		if (chatIdProp) {
+			return;
+		}
+
+		const nextTool = pendingOAuthTools[0];
+		if (sessionStorage.getItem('oauthRedirectInProgressToolId') === nextTool.id) {
+			sessionStorage.removeItem('oauthRedirectInProgressToolId');
+			return;
+		}
+
+		saveSessionSelectedModels();
+		await tick();
+		initiateOAuthRedirect(nextTool);
+	};
+
+	const resetInput = async () => {
+		selectedToolIds = [];
+		selectedSkillIds = [];
+		selectedFilterIds = [];
+		pendingOAuthTools = [];
+		webSearchEnabled = false;
+		imageGenerationEnabled = false;
+		codeInterpreterEnabled = false;
+
+		if (selectedModelIds.filter((id) => id).length > 0) {
+			await setDefaults();
 		}
 	};
 
-	const showMessage = async (message) => {
+	/** Check whether a terminal ID references an available system or direct terminal. */
+	const isTerminalAvailable = (tid: string): boolean => {
+		return (
+			($terminalServers ?? []).some((t) => t.id && t.id === tid) ||
+			($settings?.terminalServers ?? []).some((s) => s.url === tid)
+		);
+	};
+
+	$: if (
+		$terminalServers !== null &&
+		$selectedTerminalId &&
+		!isTerminalAvailable($selectedTerminalId)
+	) {
+		selectedTerminalId.set(null);
+	}
+
+	let settingDefaults = false;
+	const setDefaults = async () => {
+		if (settingDefaults) return;
+		settingDefaults = true;
+
+		try {
+			if (!$tools) {
+				tools.set(await getTools(localStorage.token));
+			}
+			if (!$functions) {
+				functions.set(await getFunctions(localStorage.token));
+			}
+			if (!$skills) {
+				skills.set(await getSkills(localStorage.token));
+			}
+			if (selectedModels.length !== 1 && !atSelectedModel) {
+				return;
+			}
+
+			const model = atSelectedModel ?? $models.find((m) => m.id === selectedModels[0]);
+			if (model) {
+				// Set Default Tools
+				if (model?.info?.meta?.toolIds) {
+					const defaultIds = [
+						...new Set(
+							[...(model?.info?.meta?.toolIds ?? [])].filter((id) =>
+								$tools.find((t) => t.id === id)
+							)
+						)
+					];
+
+					// Separate unauthenticated OAuth tools
+					const unauthed = [];
+					const authed = [];
+					for (const id of defaultIds) {
+						const tool = $tools.find((t) => t.id === id);
+						if (tool && tool.authenticated === false) {
+							const parts = id.split(':');
+							const serverId = parts.at(-1) ?? id;
+							const authType =
+								parts.length > 1 ? (parts[0] === 'server' ? parts[1] : parts[0]) : null;
+							unauthed.push({ id, name: tool.name ?? id, serverId, authType });
+						} else {
+							authed.push(id);
+						}
+					}
+					selectedToolIds = authed;
+					pendingOAuthTools = unauthed;
+					await continueOAuthRedirect();
+				} else if ($settings?.tools) {
+					selectedToolIds = $settings.tools;
+				} else {
+					selectedToolIds = selectedToolIds.filter((id) => !id.startsWith('direct_server:'));
+				}
+
+				// Set Default Skills
+				if (model?.info?.meta?.skillIds) {
+					selectedSkillIds = [
+						...new Set(
+							[...(model?.info?.meta?.skillIds ?? [])].filter((id) =>
+								($skills ?? []).find((s) => s.id === id && s.is_active)
+							)
+						)
+					];
+				} else {
+					selectedSkillIds = [];
+				}
+
+				// Set Default Filters (Toggleable only)
+				if (model?.info?.meta?.defaultFilterIds) {
+					selectedFilterIds = model.info.meta.defaultFilterIds.filter((id) =>
+						model?.filters?.find((f) => f.id === id)
+					);
+				}
+
+				// Set Default Features
+				if (model?.info?.meta?.defaultFeatureIds) {
+					if (
+						model.info?.meta?.capabilities?.['image_generation'] &&
+						$config?.features?.enable_image_generation &&
+						($user?.role === 'admin' || $user?.permissions?.features?.image_generation)
+					) {
+						imageGenerationEnabled = model.info.meta.defaultFeatureIds.includes('image_generation');
+					}
+
+					if (
+						model.info?.meta?.capabilities?.['web_search'] &&
+						$config?.features?.enable_web_search &&
+						($user?.role === 'admin' || $user?.permissions?.features?.web_search)
+					) {
+						webSearchEnabled = model.info.meta.defaultFeatureIds.includes('web_search');
+					}
+
+					if (
+						model.info?.meta?.capabilities?.['code_interpreter'] &&
+						$config?.features?.enable_code_interpreter &&
+						($user?.role === 'admin' || $user?.permissions?.features?.code_interpreter)
+					) {
+						codeInterpreterEnabled = model.info.meta.defaultFeatureIds.includes('code_interpreter');
+					}
+				}
+
+				// Set Default Terminal — only if the referenced terminal actually exists
+				if (model?.info?.meta?.terminalId) {
+					const tid = model.info.meta.terminalId;
+					if (isTerminalAvailable(tid)) {
+						selectedTerminalId.set(tid);
+					}
+				}
+			}
+		} finally {
+			settingDefaults = false;
+		}
+	};
+
+	const showMessage = async (message, scroll = true, save = true) => {
 		const _chatId = JSON.parse(JSON.stringify($chatId));
 		let _messageId = JSON.parse(JSON.stringify(message.id));
 
-		let messageChildrenIds = history.messages[_messageId].childrenIds;
+		let messageChildrenIds = [];
+		if (_messageId === null) {
+			messageChildrenIds = Object.keys(history.messages).filter(
+				(id) => history.messages[id].parentId === null
+			);
+		} else {
+			messageChildrenIds = history.messages[_messageId].childrenIds;
+		}
 
 		while (messageChildrenIds.length !== 0) {
 			_messageId = messageChildrenIds.at(-1);
@@ -210,16 +873,77 @@
 		history.currentId = _messageId;
 
 		await tick();
-		await tick();
-		await tick();
 
-		const messageElement = document.getElementById(`message-${message.id}`);
-		if (messageElement) {
-			messageElement.scrollIntoView({ behavior: 'smooth' });
+		if (($settings?.scrollOnBranchChange ?? true) && scroll) {
+			const messageElement = document.getElementById(`message-${message.id}`);
+			if (messageElement) {
+				messageElement.scrollIntoView({ behavior: 'smooth', block: 'start' });
+			}
 		}
 
 		await tick();
-		saveChatHandler(_chatId);
+		await tick();
+		await tick();
+
+		if (save) {
+			saveChatHandler(_chatId, history);
+		}
+	};
+
+	const updateLastReadAt = (id) => {
+		$socket?.emit('events:chat', {
+			chat_id: id,
+			data: { type: 'last_read_at' }
+		});
+	};
+
+	const terminalEventHandler = (type: string, data: any) => {
+		if (type === 'terminal:display_file') {
+			if (!data?.path) return;
+			displayFileHandler(data.path, { showControls, showFileNavPath });
+		} else if (type === 'terminal:write_file' || type === 'terminal:replace_file_content') {
+			if (!data?.path) return;
+			showFileNavDir.set(data.path);
+		} else if (type === 'terminal:run_command') {
+			showFileNavDir.set('/');
+		}
+	};
+
+	const dismissContextCompactionToast = () => {
+		if (contextCompactionToastId !== null) {
+			toast.dismiss(contextCompactionToastId);
+			contextCompactionToastId = null;
+		}
+	};
+
+	const handleContextCompactionStatus = (status) => {
+		if (status?.action !== 'context_compaction') {
+			return;
+		}
+
+		if (status?.done) {
+			if (contextCompactionToastId !== null) {
+				if (status?.error) {
+					toast.error($i18n.t('Context compaction failed'), {
+						id: contextCompactionToastId,
+						duration: 3000
+					});
+				} else {
+					toast.success($i18n.t('Context compacted'), {
+						id: contextCompactionToastId,
+						duration: 1800
+					});
+				}
+				contextCompactionToastId = null;
+			}
+			return;
+		}
+
+		if (contextCompactionToastId === null) {
+			contextCompactionToastId = toast.loading($i18n.t('Compacting context'), {
+				duration: Infinity
+			});
+		}
 	};
 
 	const chatEventHandler = async (event, cb) => {
@@ -227,10 +951,17 @@
 
 		if (event.chat_id === $chatId) {
 			await tick();
+			const type = event?.data?.type ?? null;
+			if (type === 'chat:reload') {
+				await loadChat();
+				return;
+			}
+			if (type === 'chat:list') {
+				return;
+			}
 			let message = history.messages[event.message_id];
 
 			if (message) {
-				const type = event?.data?.type ?? null;
 				const data = event?.data?.data ?? null;
 
 				if (type === 'status') {
@@ -239,6 +970,88 @@
 					} else {
 						message.statusHistory = [data];
 					}
+				} else if (type === 'context_compaction') {
+					handleContextCompactionStatus(data);
+				} else if (type === 'chat:active') {
+					if (!data?.active) {
+						taskIds = null;
+						if ($chatId && !$temporaryChatEnabled && hasPendingAssistantLeaf()) {
+							await loadChat();
+						}
+						if ($chatId && !$temporaryChatEnabled) {
+							updateLastReadAt($chatId);
+						}
+					}
+				} else if (type === 'chat:completion') {
+					chatCompletionEventHandler(data, message, event.chat_id);
+				} else if (type === 'chat:tasks:cancel') {
+					dismissContextCompactionToast();
+					if (event.message_id === history.currentId) {
+						taskIds = null;
+						// Set all response messages to done
+						for (const messageId of history.messages[message.parentId].childrenIds) {
+							history.messages[messageId].done = true;
+						}
+						await processNextInQueue($chatId);
+					} else {
+						message.done = true;
+					}
+				} else if (type === 'chat:message:delta' || type === 'message') {
+					message.content += data.content;
+				} else if (type === 'chat:message' || type === 'replace') {
+					message.content = data.content;
+				} else if (type === 'chat:message:files' || type === 'files') {
+					message.files = data.files;
+				} else if (type === 'chat:message:tasks') {
+					chatTasks = data.tasks;
+				} else if (type === 'chat:message:embeds' || type === 'embeds') {
+					message.embeds = data.embeds;
+
+					// Auto-scroll to the embed once it's rendered in the DOM
+					await tick();
+					setTimeout(() => {
+						const embedEl = document.getElementById(`${event.message_id}-embeds-container`);
+						if (embedEl) {
+							embedEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+						}
+					}, 100);
+				} else if (type === 'chat:message:error') {
+					message.error = data.error;
+				} else if (type === 'chat:message:follow_ups') {
+					message.followUps = data.follow_ups;
+
+					if (shouldAutoScrollResponse()) {
+						scrollToBottom('smooth');
+					}
+				} else if (type === 'chat:outlet') {
+					// Outlet filter ran on backend — sync in-memory state
+					const outletMessages = data.messages ?? [];
+					for (const msg of outletMessages) {
+						if (msg?.id && history.messages[msg.id]) {
+							const existing = history.messages[msg.id];
+							if (existing.content !== msg.content) {
+								history.messages[msg.id] = {
+									...existing,
+									originalContent: existing.content,
+									...msg
+								};
+							}
+						}
+					}
+					history = history;
+					return; // Patches history.messages directly; skip the trailing write-back.
+				} else if (type === 'chat:message:favorite') {
+					// Update message favorite status
+					message.favorite = data.favorite;
+				} else if (type === 'chat:title') {
+					chatTitle.set(data);
+					if (embedded && $chatId) {
+						await onEmbeddedChatTitle?.($chatId, data);
+					}
+					await refreshChatList(localStorage.token);
+				} else if (type === 'chat:tags') {
+					chat = await getChatById(localStorage.token, $chatId);
+					allTags.set(await getAllTags(localStorage.token));
 				} else if (type === 'source' || type === 'citation') {
 					if (data?.type === 'code_execution') {
 						// Code execution; update existing code execution by ID, or add new one.
@@ -265,32 +1078,25 @@
 							message.sources = [data];
 						}
 					}
-				} else if (type === 'chat:completion') {
-					chatCompletionEventHandler(data, message, event.chat_id);
-				} else if (type === 'chat:title') {
-					chatTitle.set(data);
-					currentChatPage.set(1);
-					await chats.set(await getChatList(localStorage.token, $currentChatPage));
-				} else if (type === 'chat:tags') {
-					chat = await getChatById(localStorage.token, $chatId);
-					allTags.set(await getAllTags(localStorage.token));
-				} else if (type === 'message') {
-					message.content += data.content;
-				} else if (type === 'replace') {
-					message.content = data.content;
-				} else if (type === 'action') {
-					if (data.action === 'continue') {
-						const continueButton = document.getElementById('continue-response-button');
+				} else if (type === 'notification') {
+					const toastType = data?.type ?? 'info';
+					const toastContent = data?.content ?? '';
 
-						if (continueButton) {
-							continueButton.click();
-						}
+					if (toastType === 'success') {
+						toast.success(toastContent);
+					} else if (toastType === 'error') {
+						toast.error(toastContent);
+					} else if (toastType === 'warning') {
+						toast.warning(toastContent);
+					} else {
+						toast.info(toastContent);
 					}
 				} else if (type === 'confirmation') {
 					eventCallback = cb;
 
 					eventConfirmationInput = false;
 					showEventConfirmation = true;
+					eventConfirmationInputOptions = [];
 
 					eventConfirmationTitle = data.title;
 					eventConfirmationMessage = data.message;
@@ -318,91 +1124,191 @@
 					eventConfirmationMessage = data.message;
 					eventConfirmationInputPlaceholder = data.placeholder;
 					eventConfirmationInputValue = data?.value ?? '';
+					eventConfirmationInputType = data?.input?.type ?? data?.type ?? '';
+					eventConfirmationInputOptions = data?.input?.options ?? data?.options ?? [];
+				} else if (type.startsWith('terminal:')) {
+					terminalEventHandler(type, data);
 				} else {
 					console.log('Unknown message type', data);
 				}
 
 				history.messages[event.message_id] = message;
 			}
+		} else {
+			// Non-active chat completion: queue stays in the global store.
+			// navigateHandler will process it when the user returns to that chat.
 		}
 	};
 
 	const onMessageHandler = async (event: {
 		origin: string;
+		source: unknown;
 		data: { type: string; text: string };
 	}) => {
-		if (event.origin !== window.origin) {
+		const isSameOrigin = event.origin === window.origin;
+		const type = event.data?.type;
+
+		// Prompt-driving types are trusted only same-origin, from our own embed iframes
+		// (opaque srcdoc origin, submission still confirmed below) or via explicit opt-in.
+		const promptTypes = ['input:prompt', 'input:prompt:submit', 'action:submit'];
+		const isOwnEmbed = isEmbedWindow(event.source);
+		const isTrusted =
+			isSameOrigin || isOwnEmbed || ($settings?.iframeSandboxAllowSameOrigin ?? false);
+
+		// Non-prompt message types are always restricted to same-origin only.
+		if (!isSameOrigin && !promptTypes.includes(type)) {
 			return;
 		}
 
-		// Replace with your iframe's origin
-		if (event.data.type === 'input:prompt') {
+		// Prompt types from an untrusted cross-origin source are silently dropped.
+		if (promptTypes.includes(type) && !isTrusted) {
+			return;
+		}
+
+		if (type === 'action:submit') {
+			console.debug(event.data.text);
+
+			if (prompt !== '') {
+				if (isSameOrigin) {
+					await tick();
+					submitHandler(prompt);
+				} else {
+					eventConfirmationInput = false;
+					eventConfirmationTitle = $i18n.t('Confirm Prompt from Embed');
+					eventConfirmationMessage = prompt;
+					eventCallback = async (confirmed: boolean) => {
+						if (confirmed) {
+							await tick();
+							submitHandler(prompt);
+						}
+					};
+					showEventConfirmation = true;
+				}
+			}
+		}
+
+		if (type === 'input:prompt') {
 			console.debug(event.data.text);
 
 			const inputElement = document.getElementById('chat-input');
 
 			if (inputElement) {
-				prompt = event.data.text;
+				messageInput?.setText(event.data.text);
 				inputElement.focus();
 			}
 		}
 
-		if (event.data.type === 'action:submit') {
+		if (type === 'input:prompt:submit') {
 			console.debug(event.data.text);
 
-			if (prompt !== '') {
-				await tick();
-				submitPrompt(prompt);
-			}
-		}
-
-		if (event.data.type === 'input:prompt:submit') {
-			console.debug(event.data.text);
-
-			if (prompt !== '') {
-				await tick();
-				submitPrompt(event.data.text);
+			if (event.data.text !== '') {
+				if (isSameOrigin) {
+					await tick();
+					submitHandler(event.data.text);
+				} else {
+					eventConfirmationInput = false;
+					eventConfirmationTitle = $i18n.t('Confirm Prompt from Embed');
+					eventConfirmationMessage = event.data.text;
+					eventCallback = async (confirmed: boolean) => {
+						if (confirmed) {
+							await tick();
+							submitHandler(event.data.text);
+						}
+					};
+					showEventConfirmation = true;
+				}
 			}
 		}
 	};
 
-	onMount(async () => {
-		console.log('mounted');
-		window.addEventListener('message', onMessageHandler);
-		$socket?.on('chat-events', chatEventHandler);
-
-		if (!$chatId) {
-			chatIdUnsubscriber = chatId.subscribe(async (value) => {
-				if (!value) {
-					await initNewChat();
+	const savedModelIds = async () => {
+		if (
+			$selectedFolder &&
+			selectedModels.filter((modelId) => modelId !== '').length > 0 &&
+			!equal($selectedFolder?.data?.model_ids, selectedModels)
+		) {
+			const res = await updateFolderById(localStorage.token, $selectedFolder.id, {
+				data: {
+					model_ids: selectedModels
 				}
 			});
-		} else {
-			if ($temporaryChatEnabled) {
-				await goto('/');
-			}
+		}
+	};
+
+	$: if (selectedModels !== null) {
+		savedModelIds();
+	}
+
+	const stopAudio = () => {
+		try {
+			speechSynthesis.cancel();
+			$audioQueue?.stop();
+		} catch {}
+	};
+
+	const hasPendingAssistantLeaf = () =>
+		Object.values(history.messages).some(
+			(message) =>
+				message?.role === 'assistant' && !message.done && (message.childrenIds?.length ?? 0) === 0
+		);
+
+	const handleSocketConnect = async () => {
+		// Gate on $chatId, not chatIdProp: chats started from the home page keep an empty chatIdProp
+		if (!$chatId || $temporaryChatEnabled) {
+			return;
 		}
 
-		if (localStorage.getItem(`chat-input-${chatIdProp}`)) {
-			try {
-				const input = JSON.parse(localStorage.getItem(`chat-input-${chatIdProp}`));
-				prompt = input.prompt;
-				files = input.files;
-				selectedToolIds = input.selectedToolIds;
-				webSearchEnabled = input.webSearchEnabled;
-			} catch (e) {
-				prompt = '';
-				files = [];
-				selectedToolIds = [];
-				webSearchEnabled = false;
-			}
+		if (!hasPendingAssistantLeaf()) {
+			return;
 		}
 
-		showControls.subscribe(async (value) => {
+		const pendingTaskIds = await getTaskIdsByChatId(localStorage.token, $chatId)
+			.then((res) => res?.task_ids ?? [])
+			.catch(() => null);
+
+		if (pendingTaskIds?.length === 0) {
+			await loadChat();
+		}
+	};
+
+	onMount(() => {
+		loading = true;
+		console.log('mounted');
+		window.addEventListener('message', onMessageHandler);
+		$socket?.on('events', chatEventHandler);
+		$socket?.on('connect', handleSocketConnect);
+
+		$audioQueue?.destroy();
+
+		const audioQueueInstance = new AudioQueue(document.getElementById('audioElement'));
+		audioQueue.set(audioQueueInstance);
+
+		// Restore direct terminal enabled states based on persisted selectedTerminalId
+		if ($settings?.terminalServers?.length) {
+			settings.set({
+				...$settings,
+				terminalServers: ($settings.terminalServers ?? []).map((s) => ({
+					...s,
+					enabled: $selectedTerminalId !== null && s.url === $selectedTerminalId
+				}))
+			});
+		}
+
+		const pageSubscribe = page.subscribe(async (p) => {
+			if (p.url.pathname === '/' || p.url.pathname.startsWith('/folders/')) {
+				await tick();
+				initNewChat();
+			}
+
+			stopAudio();
+		});
+
+		const showControlsSubscribe = showControls.subscribe(async (value) => {
+			await tick();
 			if (controlPane && !$mobile) {
 				try {
 					if (value) {
-						controlPaneComponent.openPane();
+						controlPaneComponent?.openPane();
 					} else {
 						controlPane.collapse();
 					}
@@ -413,21 +1319,90 @@
 
 			if (!value) {
 				showCallOverlay.set(false);
-				showOverview.set(false);
 				showArtifacts.set(false);
+				showEmbeds.set(false);
 			}
 		});
 
-		const chatInput = document.getElementById('chat-input');
-		chatInput?.focus();
+		const selectedFolderSubscribe = selectedFolder.subscribe(async (folder) => {
+			await tick();
+			if (folder?.data?.model_ids && !equal(selectedModels, folder.data.model_ids)) {
+				selectedModels = folder.data.model_ids;
 
-		chats.subscribe(() => {});
-	});
+				console.log('Set selectedModels from folder data:', selectedModels);
+			}
+		});
 
-	onDestroy(() => {
-		chatIdUnsubscriber?.();
-		window.removeEventListener('message', onMessageHandler);
-		// $socket?.off('chat-events');
+		const storageChatInput = sessionStorage.getItem(
+			`chat-input${chatIdProp ? `-${chatIdProp}` : ''}`
+		);
+
+		const init = async () => {
+			if (!chatIdProp) {
+				loading = false;
+				await tick();
+			}
+
+			if (storageChatInput) {
+				prompt = '';
+				messageInput?.setText('');
+
+				files = [];
+				selectedToolIds = [];
+				selectedSkillIds = [];
+				selectedFilterIds = [];
+				webSearchEnabled = false;
+				imageGenerationEnabled = false;
+				codeInterpreterEnabled = false;
+
+				try {
+					const input = JSON.parse(storageChatInput);
+
+					if (!$temporaryChatEnabled) {
+						messageInput?.setText(input.prompt);
+						files = input.files;
+						selectedToolIds = input.selectedToolIds;
+						selectedSkillIds = input.selectedSkillIds ?? [];
+						selectedFilterIds = input.selectedFilterIds;
+						webSearchEnabled = input.webSearchEnabled;
+						imageGenerationEnabled = input.imageGenerationEnabled;
+						codeInterpreterEnabled = input.codeInterpreterEnabled;
+					}
+				} catch (e) {}
+			}
+
+			const chatInput = document.getElementById('chat-input');
+			chatInput?.focus();
+		};
+		init();
+
+		return () => {
+			try {
+				clearTimeout(saveControlsTimer);
+				saveControls();
+				if (chatIdProp && !$temporaryChatEnabled) {
+					updateLastReadAt(chatIdProp);
+				}
+				pageSubscribe();
+				showControlsSubscribe();
+				selectedFolderSubscribe();
+
+				// Clear the selected chat when leaving the chat surface (e.g. navigating
+				// to the admin panel), otherwise the previously-viewed chat stays selected
+				// in the sidebar and deleting/archiving it wrongly navigates away.
+				chatId.set('');
+				chatTitle.set('');
+
+				window.removeEventListener('message', onMessageHandler);
+				$socket?.off('events', chatEventHandler);
+				$socket?.off('connect', handleSocketConnect);
+				dismissContextCompactionToast();
+				audioQueueInstance?.destroy();
+				audioQueue.set(null);
+			} catch (e) {
+				console.error(e);
+			}
+		};
 	});
 
 	// File upload functions
@@ -515,9 +1490,20 @@
 				throw new Error('Created file is empty');
 			}
 
+			// If the file is an audio file, provide the language for STT.
+			let metadata = null;
+			if (
+				(file.type.startsWith('audio/') || file.type.startsWith('video/')) &&
+				$settings?.audio?.stt?.language
+			) {
+				metadata = {
+					language: $settings?.audio?.stt?.language
+				};
+			}
+
 			// Upload file to server
 			console.log('Uploading file to server...');
-			const uploadedFile = await uploadFile(localStorage.token, file);
+			const uploadedFile = await uploadFile(localStorage.token, file, metadata);
 
 			if (!uploadedFile) {
 				throw new Error('Server returned null response for file upload');
@@ -531,7 +1517,7 @@
 			fileItem.id = uploadedFile.id;
 			fileItem.size = file.size;
 			fileItem.collection_name = uploadedFile?.meta?.collection_name;
-			fileItem.url = `${WEBUI_API_BASE_URL}/files/${uploadedFile.id}`;
+			fileItem.url = `${uploadedFile.id}`;
 
 			files = files;
 			toast.success($i18n.t('File uploaded successfully'));
@@ -546,70 +1532,162 @@
 		}
 	};
 
-	const uploadWeb = async (url) => {
-		console.log(url);
-
-		const fileItem = {
-			type: 'doc',
-			name: url,
-			collection_name: '',
-			status: 'uploading',
-			url: url,
-			error: ''
-		};
-
-		try {
-			files = [...files, fileItem];
-			const res = await processWeb(localStorage.token, '', url);
-
-			if (res) {
-				fileItem.status = 'uploaded';
-				fileItem.collection_name = res.collection_name;
-				fileItem.file = {
-					...res.file,
-					...fileItem.file
-				};
-
-				files = files;
-			}
-		} catch (e) {
-			// Remove the failed doc from the files array
-			files = files.filter((f) => f.name !== url);
-			toast.error(JSON.stringify(e));
+	const uploadWeb = async (urls) => {
+		if ($user?.role !== 'admin' && !($user?.permissions?.chat?.web_upload ?? true)) {
+			toast.error($i18n.t('You do not have permission to upload web content.'));
+			return;
 		}
-	};
 
-	const uploadYoutubeTranscription = async (url) => {
-		console.log(url);
+		if (!Array.isArray(urls)) {
+			urls = [urls];
+		}
 
-		const fileItem = {
-			type: 'doc',
+		// Create file items first
+		const fileItems = urls.map((url) => ({
+			type: 'text',
 			name: url,
 			collection_name: '',
 			status: 'uploading',
 			context: 'full',
-			url: url,
+			url,
 			error: ''
-		};
+		}));
 
-		try {
-			files = [...files, fileItem];
-			const res = await processYoutubeVideo(localStorage.token, url);
+		// Display all items at once
+		files = [...files, ...fileItems];
 
-			if (res) {
-				fileItem.status = 'uploaded';
-				fileItem.collection_name = res.collection_name;
-				fileItem.file = {
-					...res.file,
-					...fileItem.file
-				};
-				files = files;
+		for (const fileItem of fileItems) {
+			try {
+				const res = isYoutubeUrl(fileItem.url)
+					? await processYoutubeVideo(localStorage.token, fileItem.url)
+					: await processWeb(localStorage.token, '', fileItem.url);
+
+				if (res) {
+					fileItem.status = 'uploaded';
+					fileItem.collection_name = res.collection_name;
+					fileItem.file = {
+						...res.file,
+						...fileItem.file
+					};
+				}
+
+				files = [...files];
+			} catch (e) {
+				files = files.filter((f) => f.name !== url);
+				toast.error(`${e}`);
 			}
-		} catch (e) {
-			// Remove the failed doc from the files array
-			files = files.filter((f) => f.name !== url);
-			toast.error(e);
 		}
+	};
+
+	const onUpload = async (event) => {
+		const { type, data } = event;
+
+		if (type === 'google-drive') {
+			await uploadGoogleDriveFile(data);
+		} else if (type === 'web') {
+			await uploadWeb(data);
+		}
+	};
+
+	const onHistoryChange = (history) => {
+		if (history) {
+			clearTimeout(contentsRAF);
+			contentsRAF = setTimeout(() => {
+				getContents();
+				contentsRAF = null;
+			}, 0);
+		} else {
+			artifactContents.set([]);
+		}
+	};
+
+	$: onHistoryChange(history);
+
+	const dispatchCallOverlayAudio = (message, final = false) => {
+		if (!$showCallOverlay) {
+			return;
+		}
+
+		const messageContentParts = getMessageContentParts(
+			getOutputText(message?.output) || removeAllDetails(message?.content ?? ''),
+			$config?.audio?.tts?.split_on ?? 'punctuation'
+		);
+		if (!final) {
+			messageContentParts.pop();
+		}
+
+		const nextContentPart = messageContentParts.at(-1) ?? '';
+		if (!nextContentPart || (!final && nextContentPart === message.lastSentence)) {
+			return;
+		}
+
+		if (!final) {
+			message.lastSentence = nextContentPart;
+		}
+
+		eventTarget.dispatchEvent(
+			new CustomEvent('chat', {
+				detail: {
+					id: message.id,
+					content: nextContentPart
+				}
+			})
+		);
+	};
+
+	const getContents = () => {
+		const messages = history ? createMessagesList(history, history.currentId) : [];
+		let contents = [];
+		messages.forEach((message) => {
+			if (message?.role !== 'user') {
+				const messageContent =
+					getOutputText(message?.output) || removeAllDetails(message?.content ?? '');
+				if (!messageContent.trim()) {
+					return;
+				}
+
+				const { codeBlocks: codeBlocks, htmlGroups: htmlGroups } =
+					getCodeBlockContents(messageContent);
+
+				if (htmlGroups && htmlGroups.length > 0) {
+					htmlGroups.forEach((group) => {
+						const renderedContent = `
+                        <!DOCTYPE html>
+                        <html lang="en">
+                        <head>
+                            <meta charset="UTF-8">
+                            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+							<${''}style>
+								body {
+									background-color: white; /* Ensure the iframe has a white background */
+								}
+
+								${group.css}
+							</${''}style>
+                        </head>
+                        <body>
+                            ${group.html}
+
+							<${''}script>
+                            	${group.js}
+							</${''}script>
+                        </body>
+                        </html>
+                    `;
+						contents = [...contents, { type: 'iframe', content: renderedContent }];
+					});
+				} else {
+					// Check for SVG content
+					for (const block of codeBlocks) {
+						if (block.lang === 'svg' || (block.lang === 'xml' && block.code.includes('<svg'))) {
+							contents = [...contents, { type: 'svg', content: block.code }];
+						}
+					}
+				}
+			}
+		});
+
+		artifactContents.set(contents);
 	};
 
 	//////////////////////////
@@ -617,14 +1695,48 @@
 	//////////////////////////
 
 	const initNewChat = async () => {
-		if ($page.url.searchParams.get('models')) {
-			selectedModels = $page.url.searchParams.get('models')?.split(',');
-		} else if ($page.url.searchParams.get('model')) {
-			const urlModels = $page.url.searchParams.get('model')?.split(',');
+		console.log('initNewChat');
+		resetWebSearchConfirmation();
+
+		// Mark the outgoing chat as read before resetting; in-place created chats
+		// keep chatIdProp undefined, so navigateHandler never marks them read.
+		if ($chatId && !$temporaryChatEnabled) {
+			updateLastReadAt($chatId);
+		}
+
+		if ($user?.role !== 'admin' && $user?.permissions?.chat?.temporary_enforced) {
+			await temporaryChatEnabled.set(true);
+		}
+
+		if ($settings?.temporaryChatByDefault ?? false) {
+			if ($temporaryChatEnabled === false) {
+				await temporaryChatEnabled.set(true);
+			} else if ($temporaryChatEnabled === null) {
+				// if set to null set to false; refer to temp chat toggle click handler
+				await temporaryChatEnabled.set(false);
+			}
+		}
+
+		if ($user?.role !== 'admin' && !$user?.permissions?.chat?.temporary) {
+			await temporaryChatEnabled.set(false);
+		}
+
+		const availableModels = $models
+			.filter((m) => !(m?.info?.meta?.hidden ?? false))
+			.map((m) => m.id);
+
+		const defaultModels = $config?.default_models ? $config?.default_models.split(',') : [];
+
+		if ($page.url.searchParams.get('models') || $page.url.searchParams.get('model')) {
+			const urlModels = (
+				$page.url.searchParams.get('models') ||
+				$page.url.searchParams.get('model') ||
+				''
+			)?.split(',');
 
 			if (urlModels.length === 1) {
-				const m = $models.find((m) => m.id === urlModels[0]);
-				if (!m) {
+				if (!$models.find((m) => m.id === urlModels[0])) {
+					// Model not found; open model selector and prefill
 					const modelSelectorButton = document.getElementById('model-selector-0-button');
 					if (modelSelectorButton) {
 						modelSelectorButton.click();
@@ -638,45 +1750,74 @@
 						}
 					}
 				} else {
+					// Model found; set it as selected
 					selectedModels = urlModels;
 				}
 			} else {
+				// Multiple models; set as selected
 				selectedModels = urlModels;
 			}
+
+			// Unavailable models filtering
+			selectedModels = selectedModels.filter((modelId) =>
+				$models.map((m) => m.id).includes(modelId)
+			);
 		} else {
-			if (sessionStorage.selectedModels) {
-				selectedModels = JSON.parse(sessionStorage.selectedModels);
-				sessionStorage.removeItem('selectedModels');
+			if ($selectedFolder?.data?.model_ids) {
+				// Set from folder model IDs
+				selectedModels = $selectedFolder?.data?.model_ids;
 			} else {
-				if ($settings?.models) {
-					selectedModels = $settings?.models;
-				} else if ($config?.default_models) {
-					console.log($config?.default_models.split(',') ?? '');
-					selectedModels = $config?.default_models.split(',');
+				if (sessionStorage.selectedModels) {
+					// Set from session storage (temporary selection)
+					selectedModels = JSON.parse(sessionStorage.selectedModels);
+					sessionStorage.removeItem('selectedModels');
+				} else {
+					if ($settings?.models) {
+						// Set from user settings
+						selectedModels = $settings?.models;
+					} else if (defaultModels && defaultModels.length > 0) {
+						// Set from default models
+						selectedModels = defaultModels;
+					}
 				}
 			}
+
+			// Unavailable & hidden models filtering
+			selectedModels = selectedModels.filter((modelId) => availableModels.includes(modelId));
 		}
 
-		selectedModels = selectedModels.filter((modelId) => $models.map((m) => m.id).includes(modelId));
+		// Ensure at least one model is selected
 		if (selectedModels.length === 0 || (selectedModels.length === 1 && selectedModels[0] === '')) {
-			if ($models.length > 0) {
-				selectedModels = [$models[0].id];
+			if (availableModels.length > 0) {
+				if (defaultModels && defaultModels.length > 0) {
+					selectedModels = defaultModels.filter((modelId) => availableModels.includes(modelId));
+				}
+
+				if (
+					selectedModels.length === 0 ||
+					(selectedModels.length === 1 && selectedModels[0] === '')
+				) {
+					// Only fall back to first available model if default models didn't resolve
+					selectedModels = [availableModels?.at(0) ?? ''];
+				}
 			} else {
 				selectedModels = [''];
 			}
 		}
 
-		await showControls.set(false);
+		if ($mobile) {
+			await showControls.set(false);
+		}
 		await showCallOverlay.set(false);
-		await showOverview.set(false);
 		await showArtifacts.set(false);
 
-		if ($page.url.pathname.includes('/c/')) {
+		if (!embedded && $page.url.pathname.includes('/c/')) {
 			window.history.replaceState(history.state, '', `/`);
 		}
 
 		autoScroll = true;
 
+		await resetInput();
 		await chatId.set('');
 		await chatTitle.set('');
 
@@ -687,14 +1828,28 @@
 
 		chatFiles = [];
 		params = {};
+		chatVariables = {};
+		taskIds = null;
+		chatTasks = [];
 
 		if ($page.url.searchParams.get('youtube')) {
-			uploadYoutubeTranscription(
-				`https://www.youtube.com/watch?v=${$page.url.searchParams.get('youtube')}`
-			);
+			await uploadWeb(`https://www.youtube.com/watch?v=${$page.url.searchParams.get('youtube')}`);
 		}
+
+		if ($page.url.searchParams.get('load-url')) {
+			await uploadWeb($page.url.searchParams.get('load-url'));
+		}
+
 		if ($page.url.searchParams.get('web-search') === 'true') {
 			webSearchEnabled = true;
+		}
+
+		if ($page.url.searchParams.get('image-generation') === 'true') {
+			imageGenerationEnabled = true;
+		}
+
+		if ($page.url.searchParams.get('code-interpreter') === 'true') {
+			codeInterpreterEnabled = true;
 		}
 
 		if ($page.url.searchParams.get('tools')) {
@@ -711,17 +1866,68 @@
 				.filter((id) => id);
 		}
 
+		// Restore tool selection after OAuth redirect
+		const pendingToolId = sessionStorage.getItem('pendingOAuthToolId');
+		if (pendingToolId) {
+			sessionStorage.removeItem('pendingOAuthToolId');
+			if (!selectedToolIds.includes(pendingToolId)) {
+				selectedToolIds = [...selectedToolIds, pendingToolId];
+			}
+		}
+
 		if ($page.url.searchParams.get('call') === 'true') {
 			showCallOverlay.set(true);
 			showControls.set(true);
 		}
 
-		if ($page.url.searchParams.get('q')) {
-			prompt = $page.url.searchParams.get('q') ?? '';
+		// Consume one-shot desktop event (e.g. Spotlight query, call shortcut)
+		if ($desktopEvent) {
+			const event = $desktopEvent;
+			desktopEvent.set(null);
 
-			if (prompt) {
-				await tick();
-				submitPrompt(prompt);
+			if (event.type === 'call') {
+				// Defer to next macrotask so the call overlay isn't clobbered by
+				// showControlsSubscribe's initial callback (value=false → set(false))
+				// which runs as a pending microtask after this function.
+				setTimeout(() => {
+					showCallOverlay.set(true);
+					showControls.set(true);
+				}, 0);
+			} else if (event.type === 'query') {
+				const query = event.data?.query;
+				const eventFiles = event.data?.files;
+
+				// Attach screenshot images from desktop (e.g. Spotlight region capture)
+				if (eventFiles?.length) {
+					for (const ef of eventFiles) {
+						files = [
+							...files,
+							{
+								type: 'image',
+								url: ef.dataUrl,
+								name: ef.name
+							}
+						];
+					}
+				}
+
+				if (query || eventFiles?.length) {
+					if (query) {
+						messageInput?.setText(query);
+					}
+					await tick();
+					submitHandler(query || '');
+				}
+			}
+		} else if ($page.url.searchParams.get('q')) {
+			const q = $page.url.searchParams.get('q') ?? '';
+			messageInput?.setText(q);
+
+			if (q) {
+				if (($page.url.searchParams.get('submit') ?? 'true') === 'true') {
+					await tick();
+					submitHandler(q);
+				}
 			}
 		}
 
@@ -729,168 +1935,280 @@
 			$models.map((m) => m.id).includes(modelId) ? modelId : ''
 		);
 
-		const userSettings = await getUserSettings(localStorage.token);
-
-		if (userSettings) {
-			settings.set(userSettings.ui);
-		} else {
-			settings.set(JSON.parse(localStorage.getItem('settings') ?? '{}'));
-		}
-
 		const chatInput = document.getElementById('chat-input');
 		setTimeout(() => chatInput?.focus(), 0);
 	};
 
 	const loadChat = async () => {
-		chatId.set(chatIdProp);
+		noteChatDebug('loadChat start');
+		// chatIdProp is empty for chats started from the home page (URL set via replaceState)
+		chatId.set(chatIdProp || $chatId);
+		noteChatDebug('loadChat set active chat id');
+
+		if ($temporaryChatEnabled) {
+			noteChatDebug('loadChat disabling temporary chat');
+			temporaryChatEnabled.set(false);
+		}
+
 		chat = await getChatById(localStorage.token, $chatId).catch(async (error) => {
-			await goto('/');
+			console.error('[note-chat] getChatById failed', {
+				chatIdProp,
+				activeChatId: $chatId,
+				error
+			});
+			if (!embedded) {
+				await goto('/');
+			}
 			return null;
+		});
+		noteChatDebug('getChatById completed', {
+			found: !!chat,
+			chatId: chat?.id,
+			hasChatPayload: !!chat?.chat,
+			title: chat?.title
 		});
 
 		if (chat) {
 			tags = await getTagsById(localStorage.token, $chatId).catch(async (error) => {
+				console.warn('[note-chat] getTagsById failed; continuing without tags', {
+					chatIdProp,
+					activeChatId: $chatId,
+					error
+				});
 				return [];
 			});
+			noteChatDebug('getTagsById completed', { tagCount: tags?.length ?? 0 });
 
 			const chatContent = chat.chat;
+			chatVariables = chat?.variables ?? {};
 
 			if (chatContent) {
-				console.log(chatContent);
+				noteChatDebug('chat payload found', {
+					models: chatContent?.models,
+					hasHistory: !!chatContent?.history,
+					messageCount: Object.keys(chatContent?.history?.messages ?? {}).length
+				});
 
 				selectedModels =
 					(chatContent?.models ?? undefined) !== undefined
 						? chatContent.models
 						: [chatContent.models ?? ''];
+
+				if (!($user?.role === 'admin' || ($user?.permissions?.chat?.multiple_models ?? true))) {
+					selectedModels = selectedModels.length > 0 ? [selectedModels[0]] : [''];
+				}
+				if (
+					selectedModels.length === 0 ||
+					(selectedModels.length === 1 && selectedModels[0] === '')
+				) {
+					selectedModels = normalizeSelectedModels(selectedModels);
+					noteChatDebug('normalized empty selected models after load', { selectedModels });
+				}
+
+				oldSelectedModelIds = structuredClone(selectedModels);
+
 				history =
 					(chatContent?.history ?? undefined) !== undefined
 						? chatContent.history
 						: convertMessagesToHistory(chatContent.messages);
+				if (chat?.current_message_id && history?.messages?.[chat.current_message_id]) {
+					history.currentId = chat.current_message_id;
+				}
+
+				// Sanitize history: repair orphaned references and structurally-malformed
+				// nodes from failed regenerations (#24424, #24157, #20474)
+				sanitizeHistory(history);
 
 				chatTitle.set(chatContent.title);
 
-				const userSettings = await getUserSettings(localStorage.token);
+				params = structuredClone(chatContent?.params ?? {});
+				delete params.note_id;
+				chatFiles = structuredClone(chatContent?.files ?? []);
 
-				if (userSettings) {
-					await settings.set(userSettings.ui);
-				} else {
-					await settings.set(JSON.parse(localStorage.getItem('settings') ?? '{}'));
-				}
-
-				params = chatContent?.params ?? {};
-				chatFiles = chatContent?.files ?? [];
+				// Load tasks from chat-level DB field
+				chatTasks = chat?.tasks ?? [];
+				serverContextUsage = chat?.context_usage ?? null;
 
 				autoScroll = true;
 				await tick();
 
+				// Mark all non-current assistant messages as done
 				if (history.currentId) {
-					history.messages[history.currentId].done = true;
+					for (const message of Object.values(history.messages)) {
+						if (
+							message &&
+							message.role === 'assistant' &&
+							message.id !== history.currentId &&
+							message.done !== false
+						) {
+							message.done = true;
+						}
+					}
 				}
+
+				// Reconcile active tasks with message state:
+				// If the response is already done, remaining tasks are just background
+				// work (follow-ups, title gen) that shouldn't block the input.
+				const activeTaskIds = taskIds;
+				const currentMessage = history.currentId ? history.messages[history.currentId] : null;
+				const pendingTaskIds = await getTaskIdsByChatId(localStorage.token, $chatId)
+					.then((res) => res?.task_ids ?? [])
+					.catch((error) => {
+						console.warn('[note-chat] getTaskIdsByChatId failed; continuing without tasks', {
+							chatIdProp,
+							activeChatId: $chatId,
+							error
+						});
+						return [];
+					});
+				noteChatDebug('task reconciliation completed', {
+					pendingTaskCount: pendingTaskIds.length,
+					hasCurrentMessage: !!currentMessage
+				});
+				if (taskIds !== activeTaskIds) {
+					noteChatDebug('task ids changed during load; aborting stale load');
+					return;
+				}
+				const responseComplete = currentMessage?.role === 'assistant' && currentMessage?.done;
+
+				if (pendingTaskIds.length > 0 && !responseComplete) {
+					taskIds = pendingTaskIds;
+				} else {
+					taskIds = null;
+					// No active tasks and message incomplete → generation was interrupted
+					if (currentMessage?.role === 'assistant' && !currentMessage.done) {
+						currentMessage.done = true;
+					}
+				}
+
 				await tick();
 
 				return true;
 			} else {
+				console.warn('[note-chat] chat response missing chat payload', {
+					chatIdProp,
+					activeChatId: $chatId,
+					chat
+				});
 				return null;
 			}
 		}
+		console.warn('[note-chat] no chat returned from getChatById', {
+			chatIdProp,
+			activeChatId: $chatId
+		});
 	};
 
-	const scrollToBottom = async () => {
+	const scrollToBottom = async (behavior = 'auto') => {
 		await tick();
 		if (messagesContainerElement) {
-			messagesContainerElement.scrollTop = messagesContainerElement.scrollHeight;
+			messagesContainerElement.scrollTo({
+				top: messagesContainerElement.scrollHeight,
+				behavior
+			});
+
+			// content-visibility: auto causes the initial scrollHeight to be based on
+			// estimated sizes (contain-intrinsic-size). After we scroll, previously
+			// off-screen messages become visible and the browser resolves their actual
+			// heights, which shifts scrollHeight. Re-layouts can cascade across frames
+			// (new sizes reveal more content, triggering further size resolution), so
+			// we re-scroll across two animation frames to land at the true bottom.
+			requestAnimationFrame(() => {
+				if (messagesContainerElement) {
+					messagesContainerElement.scrollTo({
+						top: messagesContainerElement.scrollHeight,
+						behavior
+					});
+					requestAnimationFrame(() => {
+						if (messagesContainerElement) {
+							messagesContainerElement.scrollTo({
+								top: messagesContainerElement.scrollHeight,
+								behavior
+							});
+						}
+					});
+				}
+			});
 		}
 	};
 
-	const createMessagesList = (responseMessageId) => {
-		if (responseMessageId === null) {
-			return [];
-		}
+	const scrollToTop = async () => {
+		await messagesRef?.scrollToTop();
+	};
 
-		const message = history.messages[responseMessageId];
-		if (message?.parentId) {
-			return [...createMessagesList(message.parentId), message];
-		} else {
-			return [message];
+	const shouldAutoScrollResponse = () =>
+		autoScroll && ($settings?.scrollOnResponseGeneration ?? true);
+
+	let scrollRAF = null;
+	let contentsRAF = null;
+	const scheduleResponseScrollToBottom = () => {
+		if (!shouldAutoScrollResponse()) return;
+
+		if (!scrollRAF) {
+			scrollRAF = requestAnimationFrame(async () => {
+				scrollRAF = null;
+				await scrollToBottom();
+			});
 		}
 	};
 
-	const chatCompletedHandler = async (chatId, modelId, responseMessageId, messages) => {
-		const res = await chatCompleted(localStorage.token, {
-			model: modelId,
-			messages: messages.map((m) => ({
-				id: m.id,
-				role: m.role,
-				content: m.content,
-				info: m.info ? m.info : undefined,
-				timestamp: m.timestamp,
-				...(m.sources ? { sources: m.sources } : {})
-			})),
-			chat_id: chatId,
-			session_id: $socket?.id,
-			id: responseMessageId
-		}).catch((error) => {
-			toast.error(error);
-			messages.at(-1).error = { content: error };
+	let processingQueueChats = new Set<string>();
 
-			return null;
-		});
+	const processNextInQueue = async (targetChatId: string) => {
+		if (processingQueueChats.has(targetChatId)) return;
 
-		if (res !== null) {
-			// Update chat history with the new messages
-			for (const message of res.messages) {
-				history.messages[message.id] = {
-					...history.messages[message.id],
-					...(history.messages[message.id].content !== message.content
-						? { originalContent: history.messages[message.id].content }
-						: {}),
-					...message
-				};
-			}
-		}
+		const queue = $chatRequestQueues[targetChatId];
+		if (!queue || queue.length === 0) return;
 
-		await tick();
+		processingQueueChats.add(targetChatId);
+		try {
+			const combinedPrompt = queue.map((m) => m.prompt).join('\n\n');
+			const combinedFiles = queue.flatMap((m) => m.files);
 
-		if ($chatId == chatId) {
-			if (!$temporaryChatEnabled) {
-				chat = await updateChatById(localStorage.token, chatId, {
-					models: selectedModels,
-					messages: messages,
-					history: history,
-					params: params,
-					files: chatFiles
-				});
+			chatRequestQueues.update((q) => {
+				const { [targetChatId]: _, ...rest } = q;
+				return rest;
+			});
 
-				currentChatPage.set(1);
-				await chats.set(await getChatList(localStorage.token, $currentChatPage));
-			}
+			await submitPrompt(combinedPrompt, combinedFiles);
+		} finally {
+			processingQueueChats.delete(targetChatId);
 		}
 	};
 
-	const chatActionHandler = async (chatId, actionId, modelId, responseMessageId, event = null) => {
-		const messages = createMessagesList(responseMessageId);
+	const chatCompletedHandler = async (_chatId, modelId, responseMessageId, messages) => {
+		// Backend handles outlet filters and persistence inline.
+		// Just refresh the sidebar chat list.
+		if ($chatId == _chatId && !$temporaryChatEnabled) {
+			await refreshChatList(localStorage.token);
+		}
+	};
+
+	const chatActionHandler = async (_chatId, actionId, modelId, responseMessageId, event = null) => {
+		const messages = createMessagesList(history, responseMessageId);
 
 		const res = await chatAction(localStorage.token, actionId, {
 			model: modelId,
 			messages: messages.map((m) => ({
 				id: m.id,
 				role: m.role,
-				content: m.content,
+				content: getOutputText(m.output) || m.content,
 				info: m.info ? m.info : undefined,
 				timestamp: m.timestamp,
 				...(m.sources ? { sources: m.sources } : {})
 			})),
 			...(event ? { event: event } : {}),
-			chat_id: chatId,
+			model_item: $models.find((m) => m.id === modelId),
+			chat_id: _chatId,
 			session_id: $socket?.id,
 			id: responseMessageId
 		}).catch((error) => {
-			toast.error(error);
+			toast.error(`${error}`);
 			messages.at(-1).error = { content: error };
 			return null;
 		});
 
-		if (res !== null) {
+		if (res !== null && res.messages) {
 			// Update chat history with the new messages
 			for (const message of res.messages) {
 				history.messages[message.id] = {
@@ -903,9 +2221,9 @@
 			}
 		}
 
-		if ($chatId == chatId) {
+		if ($chatId == _chatId) {
 			if (!$temporaryChatEnabled) {
-				chat = await updateChatById(localStorage.token, chatId, {
+				chat = await updateChatById(localStorage.token, _chatId, {
 					models: selectedModels,
 					messages: messages,
 					history: history,
@@ -913,8 +2231,7 @@
 					files: chatFiles
 				});
 
-				currentChatPage.set(1);
-				await chats.set(await getChatList(localStorage.token, $currentChatPage));
+				await refreshChatList(localStorage.token);
 			}
 		}
 	};
@@ -930,14 +2247,19 @@
 	};
 
 	const createMessagePair = async (userPrompt) => {
-		prompt = '';
+		messageInput?.setText('');
 		if (selectedModels.length === 0) {
 			toast.error($i18n.t('Model not selected'));
 		} else {
 			const modelId = selectedModels[0];
 			const model = $models.filter((m) => m.id === modelId).at(0);
 
-			const messages = createMessagesList(history.currentId);
+			if (!model) {
+				toast.error($i18n.t('Model not found'));
+				return;
+			}
+
+			const messages = createMessagesList(history, history.currentId);
 			const parentMessage = messages.length !== 0 ? messages.at(-1) : null;
 
 			const userMessageId = uuidv4();
@@ -982,9 +2304,9 @@
 			}
 
 			if (messages.length === 0) {
-				await initChatHandler();
+				await initChatHandler(history);
 			} else {
-				await saveChatHandler($chatId);
+				await saveChatHandler($chatId, history);
 			}
 		}
 	};
@@ -1046,27 +2368,35 @@
 		}
 
 		if (messages.length === 0) {
-			await initChatHandler();
+			await initChatHandler(history);
 		} else {
-			await saveChatHandler($chatId);
+			await saveChatHandler($chatId, history);
 		}
 	};
 
 	const chatCompletionEventHandler = async (data, message, chatId) => {
-		const { id, done, choices, sources, selected_model_id, error, usage } = data;
+		const { id, done, choices, content, output, sources, selected_model_id, error, usage } = data;
+
+		// Store raw OR-aligned output items from backend
+		if (output) {
+			message.output = output;
+			message.content = getOutputText(output);
+			dispatchCallOverlayAudio(message);
+		}
 
 		if (error) {
 			await handleOpenAIError(error, message);
 		}
 
-		if (sources) {
+		if (sources && !message?.sources) {
 			message.sources = sources;
 		}
 
-		if (choices) {
+		if (choices && !output) {
 			if (choices[0]?.message?.content) {
 				// Non-stream response
 				message.content += choices[0]?.message?.content;
+				dispatchCallOverlayAudio(message);
 			} else {
 				// Stream response
 				let value = choices[0]?.delta?.content ?? '';
@@ -1078,31 +2408,19 @@
 					if (navigator.vibrate && ($settings?.hapticFeedback ?? false)) {
 						navigator.vibrate(5);
 					}
-
-					// Emit chat event for TTS
-					const messageContentParts = getMessageContentParts(
-						message.content,
-						$config?.audio?.tts?.split_on ?? 'punctuation'
-					);
-					messageContentParts.pop();
-
-					// dispatch only last sentence and make sure it hasn't been dispatched before
-					if (
-						messageContentParts.length > 0 &&
-						messageContentParts[messageContentParts.length - 1] !== message.lastSentence
-					) {
-						message.lastSentence = messageContentParts[messageContentParts.length - 1];
-						eventTarget.dispatchEvent(
-							new CustomEvent('chat', {
-								detail: {
-									id: message.id,
-									content: messageContentParts[messageContentParts.length - 1]
-								}
-							})
-						);
-					}
+					dispatchCallOverlayAudio(message);
 				}
 			}
+		}
+
+		if (content && !output) {
+			// REALTIME_CHAT_SAVE is disabled
+			message.content = content;
+
+			if (navigator.vibrate && ($settings?.hapticFeedback ?? false)) {
+				navigator.vibrate(5);
+			}
+			dispatchCallOverlayAudio(message);
 		}
 
 		if (selected_model_id) {
@@ -1114,18 +2432,15 @@
 			message.usage = usage;
 		}
 
+		history.messages[message.id] = message;
+
 		if (done) {
 			message.done = true;
-
-			if ($settings.notificationEnabled && !document.hasFocus()) {
-				new Notification(`${message.model}`, {
-					body: message.content,
-					icon: `${WEBUI_BASE_URL}/static/favicon.png`
-				});
-			}
+			const visibleContent =
+				getOutputText(message?.output) || removeAllDetails(message?.content ?? '');
 
 			if ($settings.responseAutoCopy) {
-				copyToClipboard(message.content);
+				copyToClipboard(visibleContent);
 			}
 
 			if ($settings.responseAutoPlayback && !$showCallOverlay) {
@@ -1133,55 +2448,233 @@
 				document.getElementById(`speak-button-${message.id}`)?.click();
 			}
 
-			// Emit chat event for TTS
-			let lastMessageContentPart =
-				getMessageContentParts(message.content, $config?.audio?.tts?.split_on ?? 'punctuation')?.at(
-					-1
-				) ?? '';
-			if (lastMessageContentPart) {
-				eventTarget.dispatchEvent(
-					new CustomEvent('chat', {
-						detail: { id: message.id, content: lastMessageContentPart }
-					})
-				);
-			}
+			// Emit chat event for TTS (only when call overlay is active)
+			dispatchCallOverlayAudio(message, true);
 			eventTarget.dispatchEvent(
 				new CustomEvent('chat:finish', {
 					detail: {
 						id: message.id,
-						content: message.content
+						content: visibleContent
 					}
 				})
 			);
 
 			history.messages[message.id] = message;
-			await chatCompletedHandler(chatId, message.model, message.id, createMessagesList(message.id));
-		}
 
-		history.messages[message.id] = message;
+			await tick();
+			if (shouldAutoScrollResponse()) {
+				scrollToBottom();
+			}
+
+			// Fire-and-forget: run chatCompletedHandler for background work
+			// (outlet filters, chat save, title gen, follow-ups, tags)
+			// without blocking the user from sending new messages.
+			chatCompletedHandler(
+				chatId,
+				message.model,
+				message.id,
+				createMessagesList(history, message.id)
+			);
+
+			// Process next queued request if any
+			await processNextInQueue(chatId);
+		}
 
 		console.log(data);
-		if (autoScroll) {
-			scrollToBottom();
-		}
+		await tick();
+
+		scheduleResponseScrollToBottom();
 	};
 
 	//////////////////////////
 	// Chat functions
 	//////////////////////////
 
-	const submitPrompt = async (userPrompt, { _raw = false } = {}) => {
-		console.log('submitPrompt', userPrompt, $chatId);
+	const submitPrompt = async (inputContent, inputFiles) => {
+		const _files = structuredClone(inputFiles);
 
-		const messages = createMessagesList(history.currentId);
+		chatFiles.push(
+			..._files.filter(
+				(item) =>
+					['doc', 'text', 'note', 'chat', 'folder', 'collection'].includes(item.type) ||
+					(item.type === 'file' && !(item?.content_type ?? '').startsWith('image/'))
+			)
+		);
+		chatFiles = chatFiles.filter(
+			// Remove duplicates
+			(item, index, array) => array.findIndex((i) => equal(i, item)) === index
+		);
+
+		// Create user message
+		let userMessageId = uuidv4();
+		let userMessage = {
+			id: userMessageId,
+			parentId: history.currentId ?? null,
+			childrenIds: [],
+			role: 'user',
+			content: inputContent,
+			files: _files.length > 0 ? _files : undefined,
+			timestamp: Math.floor(Date.now() / 1000), // Unix epoch
+			models: selectedModels
+		};
+
+		// Add message to history and Set currentId to messageId
+		history.messages[userMessageId] = userMessage;
+
+		// Append messageId to childrenIds of parent message
+		if (history.currentId !== null) {
+			history.messages[history.currentId].childrenIds.push(userMessageId);
+		}
+
+		history.currentId = userMessageId;
+
+		// focus on chat input (skip during voice call to avoid triggering mobile keyboard)
+		if (!$showCallOverlay) {
+			const chatInput = document.getElementById('chat-input');
+			chatInput?.focus();
+		}
+
+		saveSessionSelectedModels();
+
+		await sendMessage(history, userMessageId);
+	};
+
+	const handleManualCompact = async () => {
+		if (!contextCompactionEnabled) {
+			toast.message($i18n.t('Context compaction is disabled'));
+			return;
+		}
+
+		if (!$chatId || !history?.currentId) {
+			toast.message($i18n.t('No chat to compact'));
+			return;
+		}
+
+		const currentMessage = history.messages?.[history.currentId];
+		if (
+			generating ||
+			taskIds?.length ||
+			(currentMessage?.role === 'assistant' && !currentMessage.done)
+		) {
+			toast.warning($i18n.t('Wait for the current response to finish before compacting.'));
+			return;
+		}
+
+		const model = atSelectedModel?.id ?? selectedModels.find((modelId) => modelId);
+		const toastId = toast.loading($i18n.t('Compacting context...'));
+
+		try {
+			const result = await compactChatById(localStorage.token, $chatId, model);
+			serverContextUsage = result?.context_usage ?? serverContextUsage;
+
+			if (result?.compacted) {
+				toast.success($i18n.t('Context compacted'), { id: toastId });
+			} else {
+				const skippedReason =
+					result?.reason === 'too_short'
+						? $i18n.t('Chat is too short to compact')
+						: result?.reason === 'empty'
+							? $i18n.t('No chat to compact')
+							: result?.reason === 'disabled'
+								? $i18n.t('Context compaction is disabled')
+								: $i18n.t('Nothing to compact');
+				toast.message(skippedReason, { id: toastId });
+			}
+
+			await loadChat();
+		} catch (error) {
+			const message = error?.detail ?? error?.message ?? $i18n.t('Context compaction failed');
+			toast.error(message, { id: toastId });
+		} finally {
+			messageInput?.setText('');
+			prompt = '';
+			document.getElementById('chat-input')?.focus();
+		}
+	};
+
+	const handleStatusCommand = () => {
+		messageInput?.showStatus();
+		messageInput?.setText('');
+		prompt = '';
+		document.getElementById('chat-input')?.focus();
+	};
+
+	const handleForkChat = async (messageId: string | null = null) => {
+		if (!$chatId || !history?.currentId) {
+			toast.message($i18n.t('No chat to fork'));
+			return;
+		}
+		if (!($user?.role === 'admin' || ($user?.permissions?.chat?.import ?? true))) {
+			toast.error($i18n.t('Access prohibited'));
+			return;
+		}
+
+		const currentMessage = history.messages?.[history.currentId];
+		if (
+			generating ||
+			taskIds?.length ||
+			(currentMessage?.role === 'assistant' && !currentMessage.done)
+		) {
+			toast.warning($i18n.t('Wait for the current response to finish before forking.'));
+			return;
+		}
+
+		const toastId = toast.loading($i18n.t('Forking chat...'));
+
+		try {
+			const result = await forkChatById(
+				localStorage.token,
+				$chatId,
+				messageId ?? history.currentId
+			);
+
+			if (result?.id) {
+				if (!embedded) {
+					await goto(`/c/${result.id}`);
+					await refreshChatList(localStorage.token, { refreshPinned: true });
+				}
+				toast.success($i18n.t('Chat forked'), { id: toastId });
+			} else {
+				toast.error($i18n.t('Failed to fork chat'), { id: toastId });
+			}
+		} catch (error) {
+			toast.error(`${error}`, { id: toastId });
+		} finally {
+			messageInput?.setText('');
+			prompt = '';
+			document.getElementById('chat-input')?.focus();
+		}
+	};
+
+	const submitHandler = async (userPrompt, { _raw = false } = {}) => {
+		console.log('submitHandler', userPrompt, $chatId);
+
 		const _selectedModels = selectedModels.map((modelId) =>
 			$models.map((m) => m.id).includes(modelId) ? modelId : ''
 		);
-		if (JSON.stringify(selectedModels) !== JSON.stringify(_selectedModels)) {
+
+		if (!equal(selectedModels, _selectedModels)) {
 			selectedModels = _selectedModels;
 		}
 
-		if (userPrompt === '') {
+		if (String(userPrompt).trim() === '/compact') {
+			await handleManualCompact();
+			return;
+		}
+		if (String(userPrompt).trim() === '/status') {
+			handleStatusCommand();
+			return;
+		}
+		if (String(userPrompt).trim() === '/fork') {
+			await handleForkChat();
+			return;
+		}
+
+		if (pendingOAuthTools.length > 0) {
+			toast.warning($i18n.t('Please connect all required integrations before sending a message'));
+			return;
+		}
+		if (userPrompt === '' && files.length === 0) {
 			toast.error($i18n.t('Please enter a prompt'));
 			return;
 		}
@@ -1189,16 +2682,17 @@
 			toast.error($i18n.t('Model not selected'));
 			return;
 		}
+		const form = getChatVariablesForm(selectedModelIds, chatVariables, $models);
+		if (form.conflicts.length > 0) {
+			showChatVariablesModal = true;
+			toast.error($i18n.t('Chat Variables have conflicting model definitions'));
+			return;
+		}
+		if (form.missing || form.empty) {
+			showChatVariablesModal = true;
+			return;
+		}
 
-		if (messages.length != 0 && messages.at(-1).done != true) {
-			// Response not done
-			return;
-		}
-		if (messages.length != 0 && messages.at(-1).error) {
-			// Error in response
-			toast.error($i18n.t(`Oops! There was an error in the previous response.`));
-			return;
-		}
 		if (
 			files.length > 0 &&
 			files.filter((file) => file.type !== 'image' && file.status === 'uploading').length > 0
@@ -1208,6 +2702,7 @@
 			);
 			return;
 		}
+
 		if (
 			($config?.file?.max_count ?? null) !== null &&
 			files.length + chatFiles.length > $config?.file?.max_count
@@ -1220,77 +2715,84 @@
 			return;
 		}
 
-		prompt = '';
-		await tick();
-
-		// Reset chat input textarea
-		const chatInputElement = document.getElementById('chat-input');
-
-		if (chatInputElement) {
-			chatInputElement.style.height = '';
+		if (
+			$config?.features?.enable_web_search_confirmation &&
+			webSearchActive &&
+			!webSearchConfirmed
+		) {
+			pendingWebSearchPrompt = userPrompt ?? '';
+			openWebSearchConfirm();
+			return;
 		}
 
-		const _files = JSON.parse(JSON.stringify(files));
-		chatFiles.push(..._files.filter((item) => ['doc', 'file', 'collection'].includes(item.type)));
-		chatFiles = chatFiles.filter(
-			// Remove duplicates
-			(item, index, array) =>
-				array.findIndex((i) => JSON.stringify(i) === JSON.stringify(item)) === index
-		);
+		// Check if the assistant is still generating the main response
+		// (don't block on background tasks like title gen, follow-ups, tags)
+		const lastMessage = history.currentId ? history.messages[history.currentId] : null;
+		const isGenerating = lastMessage && lastMessage.role === 'assistant' && !lastMessage.done;
 
+		if (isGenerating) {
+			if ($settings?.enableMessageQueue ?? true) {
+				// Enqueue the request
+				const _files = structuredClone(files);
+				chatRequestQueues.update((q) => ({
+					...q,
+					[$chatId]: [...(q[$chatId] ?? []), { id: uuidv4(), prompt: userPrompt, files: _files }]
+				}));
+				// Clear input
+				messageInput?.setText('');
+				prompt = '';
+				files = [];
+				return;
+			} else {
+				// Interrupt: stop current generation and proceed
+				await stopResponse();
+				await tick();
+			}
+		}
+
+		if (history?.currentId) {
+			const currentMessage = history.messages[history.currentId];
+
+			if (currentMessage.error && !currentMessage.content) {
+				// Error in response
+				toast.error($i18n.t(`Oops! There was an error in the previous response.`));
+				return;
+			}
+		}
+
+		// Clear input and submit
+		messageInput?.setText('');
+		prompt = '';
+		const _files = structuredClone(files);
 		files = [];
-		prompt = '';
+		messageInput?.setText('');
 
-		// Create user message
-		let userMessageId = uuidv4();
-		let userMessage = {
-			id: userMessageId,
-			parentId: messages.length !== 0 ? messages.at(-1).id : null,
-			childrenIds: [],
-			role: 'user',
-			content: userPrompt,
-			files: _files.length > 0 ? _files : undefined,
-			timestamp: Math.floor(Date.now() / 1000), // Unix epoch
-			models: selectedModels
-		};
-
-		// Add message to history and Set currentId to messageId
-		history.messages[userMessageId] = userMessage;
-		history.currentId = userMessageId;
-
-		// Append messageId to childrenIds of parent message
-		if (messages.length !== 0) {
-			history.messages[messages.at(-1).id].childrenIds.push(userMessageId);
-		}
-
-		// Wait until history/message have been updated
-		await tick();
-
-		// focus on chat input
-		const chatInput = document.getElementById('chat-input');
-		chatInput?.focus();
-
-		saveSessionSelectedModels();
-
-		await sendPrompt(userPrompt, userMessageId, { newChat: true });
+		await submitPrompt(userPrompt, _files);
 	};
 
-	const sendPrompt = async (
-		prompt: string,
+	const sendMessage = async (
+		_history,
 		parentId: string,
-		{ modelId = null, modelIdx = null, newChat = false } = {}
+		{
+			messages = null,
+			modelId = null,
+			modelIdx = null,
+			regenerationPrompt = null
+		}: {
+			messages?: any[] | null;
+			modelId?: string | null;
+			modelIdx?: number | null;
+			regenerationPrompt?: string | null;
+		} = {}
 	) => {
-		// Create new chat if newChat is true and first user message
-		if (
-			newChat &&
-			history.messages[history.currentId].parentId === null &&
-			history.messages[history.currentId].role === 'user'
-		) {
-			await initChatHandler();
-		} else {
-			await saveChatHandler($chatId);
+		if (autoScroll) {
+			scrollToBottom();
 		}
 
+		let _chatId = JSON.parse(JSON.stringify($chatId));
+		_history = structuredClone(_history);
+
+		const responseMessageIds: Record<PropertyKey, string> = {};
 		// If modelId is provided, use it, else use selected model
 		let selectedModelIds = modelId
 			? [modelId]
@@ -1299,7 +2801,11 @@
 				: selectedModels;
 
 		// Create response messages for each selected model
-		const responseMessageIds: Record<PropertyKey, string> = {};
+		// Build message_ids list: [{model_id, message_id, modelIdx}, ...]
+		// Uses an array instead of a dict to support duplicate model IDs in side-by-side chat.
+		// modelIdx identifies each side-by-side column so the backend can persist it; without
+		// it, duplicate models collapse into one another when the chat is reloaded.
+		const messageIdsList: Array<{ model_id: string; message_id: string; modelIdx: number }> = [];
 		for (const [_modelIdx, modelId] of selectedModelIds.entries()) {
 			const model = $models.filter((m) => m.id === modelId).at(0);
 
@@ -1311,10 +2817,10 @@
 					childrenIds: [],
 					role: 'assistant',
 					content: '',
+					done: false,
 					model: model.id,
 					modelName: model.name ?? model.id,
 					modelIdx: modelIdx ? modelIdx : _modelIdx,
-					userContext: null,
 					timestamp: Math.floor(Date.now() / 1000) // Unix epoch
 				};
 
@@ -1323,7 +2829,7 @@
 				history.currentId = responseMessageId;
 
 				// Append messageId to childrenIds of parent message
-				if (parentId !== null) {
+				if (parentId !== null && history.messages[parentId]) {
 					history.messages[parentId].childrenIds = [
 						...history.messages[parentId].childrenIds,
 						responseMessageId
@@ -1331,94 +2837,179 @@
 				}
 
 				responseMessageIds[`${modelId}-${modelIdx ? modelIdx : _modelIdx}`] = responseMessageId;
+				messageIdsList.push({
+					model_id: modelId,
+					message_id: responseMessageId,
+					modelIdx: modelIdx ? modelIdx : _modelIdx
+				});
 			}
 		}
+		history = history;
+
+		// Empty embedded drafts create their backing chat only when the first message is sent.
+		if (!_chatId) {
+			if (embedded && onCreateEmbeddedChat) {
+				const createdChat = await onCreateEmbeddedChat();
+				if (!createdChat?.id) {
+					toast.error($i18n.t('Failed to create chat'));
+					return;
+				}
+
+				chat = createdChat;
+				_chatId = createdChat.id;
+				loadedChatIdProp = _chatId;
+				await chatId.set(_chatId);
+				await chatTitle.set(createdChat?.chat?.title ?? createdChat?.title ?? $i18n.t('Chat'));
+
+				params = structuredClone(createdChat?.chat?.params ?? {});
+				delete params.note_id;
+				chatFiles = mergeFiles(chatFiles, createdChat?.chat?.files ?? []);
+				await onSelectEmbeddedChat?.(_chatId);
+			} else if ($temporaryChatEnabled) {
+				_chatId = createTemporaryChatId($socket?.id);
+				await chatId.set(_chatId);
+			}
+			await tick();
+		}
+
 		await tick();
 
-		// Save chat after all messages have been created
-		await saveChatHandler($chatId);
+		// Re-clone history so sendMessageSocket gets the response messages we just added
+		_history = structuredClone(history);
 
-		const _chatId = JSON.parse(JSON.stringify($chatId));
-		await Promise.all(
-			selectedModelIds.map(async (modelId, _modelIdx) => {
-				console.log('modelId', modelId);
-				const model = $models.filter((m) => m.id === modelId).at(0);
+		// Vision capability check
+		for (const mid of selectedModelIds) {
+			const model = $models.filter((m) => m.id === mid).at(0);
+			if (model) {
+				const hasImages = createMessagesList(_history, parentId).some((message) =>
+					message.files?.some(
+						(file) => file.type === 'image' || (file?.content_type ?? '').startsWith('image/')
+					)
+				);
 
-				if (model) {
-					const messages = createMessagesList(parentId);
-					// If there are image files, check if model is vision capable
-					const hasImages = messages.some((message) =>
-						message.files?.some((file) => file.type === 'image')
+				if (
+					hasImages &&
+					!(model.info?.meta?.capabilities?.vision ?? true) &&
+					!imageGenerationEnabled
+				) {
+					toast.error(
+						$i18n.t('Model {{modelName}} is not vision capable', {
+							modelName: model.name ?? model.id
+						})
 					);
-
-					if (hasImages && !(model.info?.meta?.capabilities?.vision ?? true)) {
-						toast.error(
-							$i18n.t('Model {{modelName}} is not vision capable', {
-								modelName: model.name ?? model.id
-							})
-						);
-					}
-
-					let responseMessageId =
-						responseMessageIds[`${modelId}-${modelIdx ? modelIdx : _modelIdx}`];
-					let responseMessage = history.messages[responseMessageId];
-
-					let userContext = null;
-					if ($settings?.memory ?? false) {
-						if (userContext === null) {
-							const res = await queryMemory(localStorage.token, prompt).catch((error) => {
-								toast.error(error);
-								return null;
-							});
-							if (res) {
-								if (res.documents[0].length > 0) {
-									userContext = res.documents[0].reduce((acc, doc, index) => {
-										const createdAtTimestamp = res.metadatas[0][index].created_at;
-										const createdAtDate = new Date(createdAtTimestamp * 1000)
-											.toISOString()
-											.split('T')[0];
-										return `${acc}${index + 1}. [${createdAtDate}]. ${doc}\n`;
-									}, '');
-								}
-
-								console.log(userContext);
-							}
-						}
-					}
-					responseMessage.userContext = userContext;
-
-					const chatEventEmitter = await getChatEventEmitter(model.id, _chatId);
-
-					scrollToBottom();
-					await sendPromptSocket(model, responseMessageId, _chatId);
-
-					if (chatEventEmitter) clearInterval(chatEventEmitter);
-				} else {
-					toast.error($i18n.t(`Model {{modelId}} not found`, { modelId }));
 				}
-			})
-		);
+			}
+		}
 
-		currentChatPage.set(1);
-		chats.set(await getChatList(localStorage.token, $currentChatPage));
+		// Single request — backend fans out to all models
+		const primaryModelId = selectedModelIds[0];
+		const primaryModel = $models.filter((m) => m.id === primaryModelId).at(0);
+		const primaryResponseMessageId = messageIdsList[0]?.message_id;
+
+		if (primaryModel && primaryResponseMessageId) {
+			const chatEventEmitter = await getChatEventEmitter(primaryModel.id, _chatId);
+
+			try {
+				scrollToBottom();
+				await sendMessageSocket(
+					primaryModel,
+					messages && messages.length > 0
+						? messages
+						: createMessagesList(_history, primaryResponseMessageId),
+					_history,
+					primaryResponseMessageId,
+					_chatId,
+					{
+						// Always forward the message_ids list (not just for multi-model sends) so the
+						// backend persists each response's modelIdx — including single-column
+						// regenerations in a duplicate-model chat, which would otherwise lose their
+						// column identity and collapse on reload.
+						messageIdsList: messageIdsList.length > 0 ? messageIdsList : undefined,
+						regenerationPrompt
+					}
+				);
+			} finally {
+				if (chatEventEmitter) clearInterval(chatEventEmitter);
+			}
+		}
 	};
 
-	const sendPromptSocket = async (model, responseMessageId, _chatId) => {
-		const responseMessage = history.messages[responseMessageId];
-		const userMessage = history.messages[responseMessage.parentId];
+	const getFeatures = () => {
+		let features = {};
 
-		let files = JSON.parse(JSON.stringify(chatFiles));
+		if ($config?.features)
+			features = {
+				voice: $showCallOverlay,
+				image_generation:
+					$config?.features?.enable_image_generation &&
+					($user?.role === 'admin' || $user?.permissions?.features?.image_generation)
+						? imageGenerationEnabled
+						: false,
+				code_interpreter:
+					$config?.features?.enable_code_interpreter &&
+					($user?.role === 'admin' || $user?.permissions?.features?.code_interpreter)
+						? codeInterpreterEnabled
+						: false,
+				web_search: webSearchActive
+			};
+
+		if ($settings?.memory ?? $config?.features?.enable_memories ?? false) {
+			features = { ...features, memory: true };
+		}
+
+		return features;
+	};
+
+	const getStopTokens = () => {
+		const stop = params?.stop ?? $settings?.params?.stop;
+		if (!stop) return undefined;
+
+		const tokens = Array.isArray(stop) ? stop : stop.split(',').map((s) => s.trim());
+
+		return tokens
+			.filter(Boolean)
+			.map((token) => decodeURIComponent(JSON.parse(`"${token.replace(/"/g, '\\"')}"`)));
+	};
+
+	const sendMessageSocket = async (
+		model,
+		_messages,
+		_history,
+		responseMessageId,
+		_chatId,
+		{
+			messageIdsList,
+			regenerationPrompt,
+			continueResponse = false
+		}: {
+			messageIdsList?: Array<{ model_id: string; message_id: string }>;
+			regenerationPrompt?: string | null;
+			continueResponse?: boolean;
+		} = {}
+	) => {
+		const responseMessage = _history.messages[responseMessageId];
+		const userMessage = _history.messages[responseMessage.parentId];
+
+		const chatMessageFiles = _messages
+			.filter((message) => message.files)
+			.flatMap((message) => message.files);
+
+		// Filter chatFiles to only include files that are in the chatMessageFiles
+		chatFiles = chatFiles.filter((item) => {
+			const fileExists = chatMessageFiles.some((messageFile) => messageFile.id === item.id);
+			return fileExists;
+		});
+
+		let files = structuredClone(chatFiles);
 		files.push(
-			...(userMessage?.files ?? []).filter((item) =>
-				['doc', 'file', 'collection'].includes(item.type)
-			),
-			...(responseMessage?.files ?? []).filter((item) => ['web_search_results'].includes(item.type))
+			...(userMessage?.files ?? []).filter(
+				(item) =>
+					['doc', 'text', 'note', 'chat', 'collection', 'folder'].includes(item.type) ||
+					(item.type === 'file' && !(item?.content_type ?? '').startsWith('image/'))
+			)
 		);
 		// Remove duplicates
-		files = files.filter(
-			(item, index, array) =>
-				array.findIndex((i) => JSON.stringify(i) === JSON.stringify(item)) === index
-		);
+		files = files.filter((item, index, array) => array.findIndex((i) => equal(i, item)) === index);
 
 		scrollToBottom();
 		eventTarget.dispatchEvent(
@@ -1430,100 +3021,166 @@
 		);
 		await tick();
 
+		let userLocation;
+		if ($settings?.userLocation) {
+			userLocation = await getAndUpdateUserLocation(localStorage.token).catch((err) => {
+				console.error(err);
+				return undefined;
+			});
+		}
+
 		const stream =
 			model?.info?.params?.stream_response ??
 			$settings?.params?.stream_response ??
 			params?.stream_response ??
 			true;
+		// Always include system prompt — backend extracts it and prepends to DB messages.
+		// Only temp chats need conversation messages (persisted chats load from DB).
+		let messages: any[] = [
+			params?.system || $settings.system
+				? { role: 'system', content: `${params?.system ?? $settings?.system ?? ''}` }
+				: undefined
+		].filter(Boolean);
 
-		const messages = [
-			params?.system || $settings.system || (responseMessage?.userContext ?? null)
-				? {
-						role: 'system',
-						content: `${promptTemplate(
-							params?.system ?? $settings?.system ?? '',
-							$user.name,
-							$settings?.userLocation
-								? await getAndUpdateUserLocation(localStorage.token)
-								: undefined
-						)}${
-							(responseMessage?.userContext ?? null)
-								? `\n\nUser Context:\n${responseMessage?.userContext ?? ''}`
-								: ''
-						}`
+		if ($temporaryChatEnabled) {
+			messages = [
+				...messages,
+				..._messages.map((message) => ({
+					...message,
+					...(message.output && message.role === 'assistant'
+						? { output: message.output }
+						: { content: processDetails(message.content) })
+				}))
+			].filter((message) => message);
+
+			messages = messages
+				.map((message) => {
+					const imageFiles = (message?.files ?? []).filter(
+						(file) => file.type === 'image' || (file?.content_type ?? '').startsWith('image/')
+					);
+
+					if (message.output && message.role === 'assistant') {
+						return { role: message.role, output: message.output };
 					}
-				: undefined,
-			...createMessagesList(responseMessageId)
-		]
-			.filter((message) => message?.content?.trim())
-			.map((message, idx, arr) => ({
-				role: message.role,
-				...((message.files?.filter((file) => file.type === 'image').length > 0 ?? false) &&
-				message.role === 'user'
-					? {
+
+					if (message.role === 'user' && imageFiles.length > 0) {
+						return {
+							role: message.role,
 							content: [
 								{
 									type: 'text',
 									text: message?.merged?.content ?? message.content
 								},
-								...message.files
-									.filter((file) => file.type === 'image')
-									.map((file) => ({
-										type: 'image_url',
-										image_url: {
-											url: file.url
-										}
-									}))
+								...imageFiles.map((file) => ({
+									type: 'image_url',
+									image_url: {
+										url: file.url
+									}
+								}))
 							]
-						}
-					: {
-							content: message?.merged?.content ?? message.content
-						})
-			}));
+						};
+					}
+
+					return {
+						role: message.role,
+						content: message?.merged?.content ?? message.content
+					};
+				})
+				.filter(
+					(message) =>
+						message?.role === 'user' || message?.content?.trim() || message?.output?.length
+				);
+		}
+
+		const toolIds = [];
+		const toolServerIds = [];
+
+		for (const toolId of selectedToolIds) {
+			if (toolId.startsWith('direct_server:')) {
+				let serverId = toolId.replace('direct_server:', '');
+				// Check if serverId is a number
+				if (!isNaN(parseInt(serverId))) {
+					toolServerIds.push(parseInt(serverId));
+				} else {
+					toolServerIds.push(serverId);
+				}
+			} else {
+				toolIds.push(toolId);
+			}
+		}
+
+		// Menu-selected skills are sent as IDs; inline <$skillId|label> mentions stay
+		// in the message so the backend can inject their full content.
+		const skillIds = [...selectedSkillIds];
+
+		// Use the user-selected terminal from the dropdown
+		const activeTerminalId = $selectedTerminalId ?? null;
+
+		// Only send terminal_id if the model has terminal capability enabled
+		const terminalEnabled = model.info?.meta?.capabilities?.terminal ?? true;
+		const useChatVariablesFallback =
+			!_chatId || $temporaryChatEnabled || isTemporaryChatId(_chatId);
 
 		const res = await generateOpenAIChatCompletion(
 			localStorage.token,
 			{
 				stream: stream,
 				model: model.id,
-				messages: messages,
+				...(messages.length > 0 ? { messages } : {}),
 				params: {
 					...$settings?.params,
 					...params,
-
-					format: $settings.requestFormat ?? undefined,
-					keep_alive: $settings.keepAlive ?? undefined,
-					stop:
-						(params?.stop ?? $settings?.params?.stop ?? undefined)
-							? (params?.stop.split(',').map((token) => token.trim()) ?? $settings.params.stop).map(
-									(str) => decodeURIComponent(JSON.parse('"' + str.replace(/\"/g, '\\"') + '"'))
-								)
-							: undefined
+					stop: getStopTokens()
 				},
 
-				files: files.length > 0 ? files : undefined,
-				tool_ids: selectedToolIds.length > 0 ? selectedToolIds : undefined,
-				features: {
-					web_search: webSearchEnabled
+				files: (files?.length ?? 0) > 0 ? files : undefined,
+
+				filter_ids: selectedFilterIds.length > 0 ? selectedFilterIds : undefined,
+				tool_ids: toolIds.length > 0 ? toolIds : undefined,
+				skill_ids: skillIds.length > 0 ? skillIds : undefined,
+				terminal_id: terminalEnabled ? (activeTerminalId ?? undefined) : undefined,
+				tool_servers: [
+					...($toolServers ?? []).filter(
+						(server, idx) => toolServerIds.includes(idx) || toolServerIds.includes(server?.id)
+					),
+					// Direct terminal servers — always included when enabled (not routed through selectedToolIds)
+					...($terminalServers ?? []).filter((t) => !t.id)
+				],
+				features: getFeatures(),
+				variables: {
+					...getPromptVariables(
+						$user?.name,
+						$settings?.userLocation ? userLocation : undefined,
+						$user?.email
+					)
 				},
+				...(useChatVariablesFallback ? { chat_variables: chatVariables } : {}),
+				model_item: $models.find((m) => m.id === model.id),
 
 				session_id: $socket?.id,
-				chat_id: $chatId,
-				id: responseMessageId,
+				chat_id: _chatId || undefined,
+				folder_id: $selectedFolder?.id ?? undefined,
 
-				...(!$temporaryChatEnabled &&
-				(messages.length == 1 ||
-					(messages.length == 2 &&
-						messages.at(0)?.role === 'system' &&
-						messages.at(1)?.role === 'user')) &&
-				selectedModels[0] === model.id
-					? {
-							background_tasks: {
+				id: responseMessageId,
+				...(messageIdsList ? { message_ids: messageIdsList } : {}),
+				parent_id: userMessage?.parentId ?? null,
+				user_message: userMessage,
+				...(regenerationPrompt ? { regeneration_prompt: regenerationPrompt } : {}),
+				...(continueResponse ? { assistant_message_id: responseMessageId } : {}),
+
+				background_tasks: {
+					...(!$temporaryChatEnabled &&
+					(!_chatId ||
+						(embedded &&
+							(userMessage?.parentId ?? null) === null &&
+							createMessagesList(_history, responseMessageId).length === 2))
+						? {
 								title_generation: $settings?.title?.auto ?? true,
 								tags_generation: $settings?.autoTags ?? true
 							}
-						}
-					: {}),
+						: {}),
+					follow_up_generation: $settings?.autoFollowUps ?? true
+				},
 
 				...(stream && (model.info?.meta?.capabilities?.usage ?? false)
 					? {
@@ -1534,24 +3191,71 @@
 					: {})
 			},
 			`${WEBUI_BASE_URL}/api`
-		).catch((error) => {
+		).catch(async (error) => {
 			console.log(error);
+
+			let errorMessage = error;
+			if (error?.error?.message) {
+				errorMessage = error.error.message;
+			} else if (error?.message) {
+				errorMessage = error.message;
+			}
+
+			if (typeof errorMessage === 'object') {
+				errorMessage = $i18n.t(`Uh-oh! There was an issue with the response.`);
+			}
+
+			toast.error(`${errorMessage}`);
 			responseMessage.error = {
 				content: error
 			};
+
 			responseMessage.done = true;
+
 			history.messages[responseMessageId] = responseMessage;
+			history.currentId = responseMessageId;
+
 			return null;
 		});
 
-		console.log(res);
-
 		if (res) {
-			taskId = res.task_id;
+			if (res.error) {
+				await handleOpenAIError(res.error, responseMessage);
+			} else {
+				// Backend returns task_ids (multi-model) or task_id (single model)
+				const newTaskIds = res.task_ids ?? (res.task_id ? [res.task_id] : []);
+				if (newTaskIds.length > 0) {
+					taskIds = [...(taskIds ?? []), ...newTaskIds];
+				}
+
+				// Backend returns chat_id for new chats — set store + URL.
+				// Only update if the user hasn't navigated to a different chat
+				// while the request was in flight (prevents overwriting $chatId
+				// and causing spurious toast notifications / state duplication).
+				if (res.chat_id && $chatId !== res.chat_id && $chatId === _chatId) {
+					await chatId.set(res.chat_id);
+					if (!$temporaryChatEnabled && !embedded) {
+						window.history.replaceState(history.state, '', `/c/${res.chat_id}`);
+						await refreshChatList(localStorage.token);
+
+						// Persist chat-level params (system prompt, advanced
+						// params) that the backend doesn't receive in the
+						// chat completion request.  Files are now persisted
+						// by the backend at chat creation time.
+						if (Object.keys(params).length > 0) {
+							await updateChatById(localStorage.token, res.chat_id, {
+								params: params
+							});
+						}
+					}
+				}
+			}
 		}
 
 		await tick();
-		scrollToBottom();
+		if (shouldAutoScrollResponse()) {
+			scrollToBottom();
+		}
 	};
 
 	const handleOpenAIError = async (error, responseMessage) => {
@@ -1564,9 +3268,11 @@
 
 		console.error(innerError);
 		if ('detail' in innerError) {
+			// FastAPI error
 			toast.error(innerError.detail);
 			errorMessage = innerError.detail;
 		} else if ('error' in innerError) {
+			// OpenAI error
 			if ('message' in innerError.error) {
 				toast.error(innerError.error.message);
 				errorMessage = innerError.error.message;
@@ -1575,6 +3281,7 @@
 				errorMessage = innerError.error;
 			}
 		} else if ('message' in innerError) {
+			// OpenAI error
 			toast.error(innerError.message);
 			errorMessage = innerError.message;
 		}
@@ -1593,24 +3300,47 @@
 		history.messages[responseMessage.id] = responseMessage;
 	};
 
-	const stopResponse = () => {
-		if (taskId) {
-			const res = stopTask(localStorage.token, taskId).catch((error) => {
-				return null;
-			});
-
-			if (res) {
-				taskId = null;
-
-				const responseMessage = history.messages[history.currentId];
-				responseMessage.done = true;
-
-				history.messages[history.currentId] = responseMessage;
-
-				if (autoScroll) {
-					scrollToBottom();
+	const stopResponse = async (processQueue = true) => {
+		if (taskIds) {
+			if ($chatId) {
+				await stopTasksByChatId(localStorage.token, $chatId).catch((error) => {
+					toast.error(`${error}`);
+					return null;
+				});
+			} else {
+				for (const taskId of taskIds) {
+					const res = await stopTask(localStorage.token, taskId).catch((error) => {
+						toast.error(`${error}`);
+						return null;
+					});
 				}
 			}
+
+			taskIds = null;
+
+			const responseMessage = history.messages[history.currentId];
+			// Set all response messages to done
+			if (responseMessage.parentId && history.messages[responseMessage.parentId]) {
+				for (const messageId of history.messages[responseMessage.parentId].childrenIds) {
+					history.messages[messageId].done = true;
+				}
+			}
+
+			history.messages[history.currentId] = responseMessage;
+
+			if (shouldAutoScrollResponse()) {
+				scrollToBottom();
+			}
+		}
+
+		if (generating) {
+			generating = false;
+			generationController?.abort();
+			generationController = null;
+		}
+
+		if (processQueue) {
+			await processNextInQueue($chatId);
 		}
 	};
 
@@ -1624,7 +3354,8 @@
 			childrenIds: [],
 			role: 'user',
 			content: userPrompt,
-			models: selectedModels
+			models: selectedModels,
+			timestamp: Math.floor(Date.now() / 1000) // Unix epoch
 		};
 
 		if (parentId !== null) {
@@ -1638,27 +3369,44 @@
 		history.currentId = userMessageId;
 
 		await tick();
-		await sendPrompt(userPrompt, userMessageId);
+
+		if (autoScroll) {
+			scrollToBottom();
+		}
+
+		await sendMessage(history, userMessageId);
 	};
 
-	const regenerateResponse = async (message) => {
+	const regenerateResponse = async (message, suggestionPrompt = null) => {
 		console.log('regenerateResponse');
 
 		if (history.currentId) {
 			let userMessage = history.messages[message.parentId];
-			let userPrompt = userMessage.content;
 
-			if ((userMessage?.models ?? [...selectedModels]).length == 1) {
-				// If user message has only one model selected, sendPrompt automatically selects it for regeneration
-				await sendPrompt(userPrompt, userMessage.id);
-			} else {
-				// If there are multiple models selected, use the model of the response message for regeneration
-				// e.g. many model chat
-				await sendPrompt(userPrompt, userMessage.id, {
-					modelId: message.model,
-					modelIdx: message.modelIdx
-				});
+			if (!userMessage) {
+				toast.error($i18n.t('Parent message not found'));
+				return;
 			}
+
+			if (autoScroll) {
+				scrollToBottom();
+			}
+
+			await sendMessage(history, userMessage.id, {
+				...(suggestionPrompt
+					? {
+							messages: createMessagesList(history, message.id),
+							regenerationPrompt: suggestionPrompt
+						}
+					: {}),
+				...((userMessage?.models ?? [...selectedModels]).length > 1
+					? {
+							// If multiple models are selected, use the model from the message
+							modelId: message.model,
+							modelIdx: message.modelIdx
+						}
+					: {})
+			});
 		}
 	};
 
@@ -1676,7 +3424,14 @@
 				.at(0);
 
 			if (model) {
-				await sendPromptSocket(model, responseMessage.id, _chatId);
+				await sendMessageSocket(
+					model,
+					createMessagesList(history, responseMessage.id),
+					history,
+					responseMessage.id,
+					_chatId,
+					{ continueResponse: true }
+				);
 			}
 		}
 	};
@@ -1692,18 +3447,25 @@
 		history.messages[messageId] = message;
 
 		try {
+			generating = true;
 			const [res, controller] = await generateMoACompletion(
 				localStorage.token,
-				message.model,
-				history.messages[message.parentId].content,
+				message.model ?? '',
+				message.parentId ? history.messages[message.parentId].content : '',
 				responses
 			);
 
-			if (res && res.ok && res.body) {
-				const textStream = await createOpenAITextStream(res.body, $settings.splitLargeChunks);
+			if (res && res.ok && res.body && generating) {
+				generationController = controller as AbortController;
+				const textStream = await createOpenAITextStream(
+					res.body,
+					Boolean($settings?.splitLargeChunks ?? false)
+				);
 				for await (const update of textStream) {
 					const { value, done, sources, error, usage } = update;
 					if (error || done) {
+						generating = false;
+						generationController = null;
 						break;
 					}
 
@@ -1714,12 +3476,10 @@
 						history.messages[messageId] = message;
 					}
 
-					if (autoScroll) {
-						scrollToBottom();
-					}
+					scheduleResponseScrollToBottom();
 				}
 
-				await saveChatHandler(_chatId);
+				await saveChatHandler(_chatId, history);
 			} else {
 				console.error(res);
 			}
@@ -1728,58 +3488,263 @@
 		}
 	};
 
-	const initChatHandler = async () => {
+	const initChatHandler = async (history) => {
+		let _chatId = $chatId;
+		const selectedFolderId = $selectedFolder?.id;
+
 		if (!$temporaryChatEnabled) {
-			chat = await createNewChat(localStorage.token, {
-				id: $chatId,
-				title: $i18n.t('New Chat'),
-				models: selectedModels,
-				system: $settings.system ?? undefined,
-				params: params,
-				history: history,
-				messages: createMessagesList(history.currentId),
-				tags: [],
-				timestamp: Date.now()
-			});
+			chat = await createNewChat(
+				localStorage.token,
+				{
+					id: _chatId,
+					title: $i18n.t('New Chat'),
+					models: selectedModels,
+					system: $settings.system ?? undefined,
+					params: params,
+					history: history,
+					messages: createMessagesList(history, history.currentId),
+					tags: [],
+					timestamp: Date.now()
+				},
+				$selectedFolder?.id,
+				chatVariables
+			);
 
-			currentChatPage.set(1);
-			await chats.set(await getChatList(localStorage.token, $currentChatPage));
-			await chatId.set(chat.id);
+			_chatId = chat.id;
+			await chatId.set(_chatId);
 
-			window.history.replaceState(history.state, '', `/c/${chat.id}`);
+			if (!embedded) {
+				window.history.replaceState(history.state, '', `/c/${_chatId}`);
+			}
+
+			await tick();
+
+			if (!embedded) {
+				await refreshChatList(localStorage.token);
+			}
+
+			if (selectedFolderId) {
+				await refreshFolderChatLists(selectedFolderId, chat);
+			}
+
+			selectedFolder.set(null);
 		} else {
-			await chatId.set('local');
+			_chatId = createTemporaryChatId($socket?.id);
+			await chatId.set(_chatId);
 		}
 		await tick();
+
+		return _chatId;
 	};
 
-	const saveChatHandler = async (_chatId) => {
+	const saveChatHandler = async (_chatId, history) => {
 		if ($chatId == _chatId) {
 			if (!$temporaryChatEnabled) {
 				chat = await updateChatById(localStorage.token, _chatId, {
 					models: selectedModels,
 					history: history,
-					messages: createMessagesList(history.currentId),
+					messages: createMessagesList(history, history.currentId),
 					params: params,
 					files: chatFiles
 				});
-
-				currentChatPage.set(1);
-				await chats.set(await getChatList(localStorage.token, $currentChatPage));
 			}
+		}
+	};
+
+	const saveControls = async () => {
+		if (!$chatId || $temporaryChatEnabled) return;
+		const loaded = chat?.chat ?? {};
+		if (equal(params, loaded.params ?? {}) && equal(chatFiles, loaded.files ?? [])) return;
+
+		const res = await updateChatById(localStorage.token, $chatId, {
+			params,
+			files: chatFiles
+		}).catch((err) => {
+			console.error('[controls autosave]', err);
+			return null;
+		});
+		// Refresh the dedupe baseline so a later revert still saves.
+		if (res) chat = res;
+	};
+
+	const MAX_DRAFT_LENGTH = 5000;
+	let saveDraftTimeout: ReturnType<typeof setTimeout> | null = null;
+
+	const saveDraft = async (draft: any, chatId: string | null = null) => {
+		if (saveDraftTimeout) {
+			clearTimeout(saveDraftTimeout);
+		}
+
+		if (draft.prompt !== null && draft.prompt.length < MAX_DRAFT_LENGTH) {
+			saveDraftTimeout = setTimeout(async () => {
+				await sessionStorage.setItem(
+					`chat-input${chatId ? `-${chatId}` : ''}`,
+					JSON.stringify(draft)
+				);
+			}, 500);
+		} else {
+			sessionStorage.removeItem(`chat-input${chatId ? `-${chatId}` : ''}`);
+		}
+	};
+
+	const clearDraft = async (chatId: string | null = null) => {
+		if (saveDraftTimeout) {
+			clearTimeout(saveDraftTimeout);
+		}
+		await sessionStorage.removeItem(`chat-input${chatId ? `-${chatId}` : ''}`);
+	};
+
+	const moveChatHandler = async (chatId, folderId) => {
+		if (chatId && folderId) {
+			const res = await updateChatFolderIdById(localStorage.token, chatId, folderId).catch(
+				(error) => {
+					toast.error(`${error}`);
+					return null;
+				}
+			);
+
+			if (res) {
+				await refreshChatList(localStorage.token, { refreshPinned: true });
+				await refreshFolderChatLists();
+
+				toast.success($i18n.t('Chat moved successfully'));
+			}
+		} else {
+			toast.error($i18n.t('Failed to move chat'));
+		}
+	};
+
+	const archiveChatHandler = async (id: string) => {
+		try {
+			await archiveChatById(localStorage.token, id);
+			initNewChat();
+			await goto('/');
+			await refreshChatList(localStorage.token, { refreshPinned: true });
+			await refreshFolderChatLists();
+			toast.success($i18n.t('Chat archived.'));
+		} catch (error) {
+			console.error('Error archiving chat:', error);
+			toast.error($i18n.t('Failed to archive chat.'));
+		}
+	};
+
+	let showDeleteConfirm = false;
+
+	const confirmWebSearch = async () => {
+		const userPrompt = pendingWebSearchPrompt;
+		pendingWebSearchPrompt = null;
+		webSearchConfirmed = true;
+
+		if (userPrompt !== null) {
+			await submitHandler(userPrompt);
+		} else {
+			webSearchEnabled = true;
+		}
+	};
+
+	const deleteChatHandler = async (id: string) => {
+		showDeleteConfirm = true;
+	};
+
+	const confirmDeleteChat = async () => {
+		const id = $chatId;
+		if (!id) return;
+
+		try {
+			const res = await deleteChatById(localStorage.token, id);
+			if (res) {
+				initNewChat();
+				await goto('/');
+				await refreshChatList(localStorage.token, { refreshPinned: true });
+				allTags.set(await getAllTags(localStorage.token));
+				toast.success($i18n.t('Chat deleted.'));
+			}
+		} catch (error) {
+			console.error('Error deleting chat:', error);
+			toast.error(`${error}`);
 		}
 	};
 </script>
 
 <svelte:head>
 	<title>
-		{$chatTitle
-			? `${$chatTitle.length > 30 ? `${$chatTitle.slice(0, 30)}...` : $chatTitle} | ${$WEBUI_NAME}`
+		{$settings.showChatTitleInTab !== false && $chatTitle
+			? `${$chatTitle.length > 30 ? `${$chatTitle.slice(0, 30)}...` : $chatTitle} / ${$WEBUI_NAME}`
 			: `${$WEBUI_NAME}`}
 	</title>
 </svelte:head>
 
-<audio id="audioElement" src="" style="display: none;" />
+<audio id="audioElement" style="display: none;"></audio>
+
+{#if getChatVariablesForm(selectedModelIds, chatVariables, $models).conflicts.length > 0}
+	<Modal bind:show={showChatVariablesModal} size="md">
+		<div>
+			<div class="flex justify-between px-4 pt-3 pb-1 dark:text-gray-300">
+				<div class="self-center text-sm font-medium">{$i18n.t('Chat Variables')}</div>
+				<button
+					class="self-center rounded-lg p-1 text-gray-500 transition hover:bg-gray-50 hover:text-gray-700 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200"
+					on:click={() => {
+						showChatVariablesModal = false;
+					}}
+				>
+					<XMark className="size-4" />
+				</button>
+			</div>
+
+			<div class="px-5 pb-4 text-sm text-gray-600 dark:text-gray-300">
+				<div class="mb-2 text-xs text-gray-500 dark:text-gray-400">
+					{$i18n.t('Selected models define incompatible Chat Variables.')}
+				</div>
+				<div class="flex flex-col gap-1">
+					{#each getChatVariablesForm(selectedModelIds, chatVariables, $models).conflicts as conflict}
+						<div class="rounded-lg border border-red-200 px-3 py-2 text-xs dark:border-red-900/60">
+							<div class="font-medium text-red-600 dark:text-red-400">{conflict.key}</div>
+							<div class="mt-1 text-gray-500 dark:text-gray-400">
+								{conflict.modelIds.join(', ')}
+							</div>
+						</div>
+					{/each}
+				</div>
+			</div>
+		</div>
+	</Modal>
+{:else}
+	<InputVariablesModal
+		bind:show={showChatVariablesModal}
+		title={$i18n.t('Chat Variables')}
+		variables={getChatVariablesForm(selectedModelIds, chatVariables, $models).variables}
+		onSave={saveChatVariables}
+	/>
+{/if}
+
+<WebSearchConfirmDialog
+	bind:show={showWebSearchConfirm}
+	title={$i18n.t('Use Web Search?')}
+	message={($config?.features?.web_search_confirmation_content ?? '').trim() !== ''
+		? ($config?.features?.web_search_confirmation_content ?? '')
+		: $i18n.t('Your query will be sent to the configured web search provider.')}
+	confirmLabel={$i18n.t('Continue')}
+	cancelLabel={$i18n.t('Cancel')}
+	on:confirm={confirmWebSearch}
+	on:cancel={() => {
+		if (pendingWebSearchPrompt === null) {
+			webSearchEnabled = false;
+		}
+		pendingWebSearchPrompt = null;
+	}}
+/>
+
+<DeleteConfirmDialog
+	bind:show={showDeleteConfirm}
+	title={$i18n.t('Delete chat?')}
+	on:confirm={() => {
+		confirmDeleteChat();
+	}}
+>
+	<div class=" text-sm text-gray-500 flex-1 line-clamp-3">
+		{$i18n.t('This will delete')} <span class="  font-normal">{$chatTitle}</span>.
+	</div>
+</DeleteConfirmDialog>
 
 <EventConfirmDialog
 	bind:show={showEventConfirmation}
@@ -1788,8 +3753,12 @@
 	input={eventConfirmationInput}
 	inputPlaceholder={eventConfirmationInputPlaceholder}
 	inputValue={eventConfirmationInputValue}
+	inputType={eventConfirmationInputType}
+	inputOptions={eventConfirmationInputOptions}
 	on:confirm={(e) => {
-		if (e.detail) {
+		if (eventConfirmationInput) {
+			eventCallback(e.detail);
+		} else if (e.detail) {
 			eventCallback(e.detail);
 		} else {
 			eventCallback(true);
@@ -1800,213 +3769,437 @@
 	}}
 />
 
-{#if !chatIdProp || (loaded && chatIdProp)}
-	<div
-		class="h-screen max-h-[100dvh] {$showSidebar
-			? 'md:max-w-[calc(100%-260px)]'
-			: ''} w-full max-w-full flex flex-col"
-		id="chat-container"
-	>
-		{#if $settings?.backgroundImageUrl ?? null}
-			<div
-				class="absolute {$showSidebar
-					? 'md:max-w-[calc(100%-260px)] md:translate-x-[260px]'
-					: ''} top-0 left-0 w-full h-full bg-cover bg-center bg-no-repeat"
-				style="background-image: url({$settings.backgroundImageUrl})  "
-			/>
+<div
+	class="{embedded
+		? 'h-full'
+		: 'h-screen max-h-[100dvh]'} transition-width duration-200 ease-in-out {$showSidebar &&
+	!embedded
+		? '  md:max-w-[calc(100%-var(--sidebar-width))]'
+		: ' '} w-full max-w-full flex flex-col"
+	id={chatContainerId}
+>
+	{#if !loading}
+		<div in:fade={{ duration: 50 }} class="w-full h-full flex flex-col">
+			{#if !embedded && $selectedFolder && $selectedFolder?.meta?.background_image_url}
+				<div
+					class="absolute top-0 left-0 w-full h-full bg-cover bg-center bg-no-repeat"
+					style="background-image: url({$selectedFolder?.meta?.background_image_url})  "
+				/>
 
-			<div
-				class="absolute top-0 left-0 w-full h-full bg-gradient-to-t from-white to-white/85 dark:from-gray-900 dark:to-[#171717]/90 z-0"
-			/>
-		{/if}
+				<div
+					class="absolute top-0 left-0 w-full h-full bg-linear-to-t from-white to-white/85 dark:from-gray-900 dark:to-gray-900/90 z-0"
+				/>
+			{:else if !embedded && ($settings?.backgroundImageUrl ?? $config?.license_metadata?.background_image_url ?? null)}
+				<div
+					class="absolute top-0 left-0 w-full h-full bg-cover bg-center bg-no-repeat"
+					style="background-image: url({$settings?.backgroundImageUrl ??
+						$config?.license_metadata?.background_image_url})  "
+				/>
 
-		<Navbar
-			bind:this={navbarElement}
-			chat={{
-				id: $chatId,
-				chat: {
-					title: $chatTitle,
-					models: selectedModels,
-					system: $settings.system ?? undefined,
-					params: params,
-					history: history,
-					timestamp: Date.now()
-				}
-			}}
-			title={$chatTitle}
-			bind:selectedModels
-			shareEnabled={!!history.currentId}
-			{initNewChat}
-		/>
+				<div
+					class="absolute top-0 left-0 w-full h-full bg-linear-to-t from-white to-white/85 dark:from-gray-900 dark:to-gray-900/90 z-0"
+				/>
+			{/if}
 
-		<PaneGroup direction="horizontal" class="w-full h-full">
-			<Pane defaultSize={50} class="h-full flex w-full relative">
-				{#if $banners.length > 0 && !history.currentId && !$chatId && selectedModels.length <= 1}
-					<div class="absolute top-12 left-0 right-0 w-full z-30">
-						<div class=" flex flex-col gap-1 w-full">
-							{#each $banners.filter( (b) => (b.dismissible ? !JSON.parse(localStorage.getItem('dismissedBannerIds') ?? '[]').includes(b.id) : true) ) as banner}
-								<Banner
-									{banner}
-									on:dismiss={(e) => {
-										const bannerId = e.detail;
-
-										localStorage.setItem(
-											'dismissedBannerIds',
-											JSON.stringify(
-												[
-													bannerId,
-													...JSON.parse(localStorage.getItem('dismissedBannerIds') ?? '[]')
-												].filter((id) => $banners.find((b) => b.id === id))
-											)
-										);
-									}}
-								/>
-							{/each}
-						</div>
-					</div>
-				{/if}
-
-				<div class="flex flex-col flex-auto z-10 w-full">
-					{#if $settings?.landingPageMode === 'chat' || createMessagesList(history.currentId).length > 0}
+			<PaneGroup direction="horizontal" class="w-full h-full">
+				<Pane defaultSize={50} minSize={30} class="h-full flex relative max-w-full flex-col">
+					<FilesOverlay show={dragged} />
+					{#if embedded}
 						<div
-							class=" pb-2.5 flex flex-col justify-between w-full flex-auto overflow-auto h-0 max-w-full z-10 scrollbar-hidden"
-							id="messages-container"
-							bind:this={messagesContainerElement}
-							on:scroll={(e) => {
-								autoScroll =
-									messagesContainerElement.scrollHeight - messagesContainerElement.scrollTop <=
-									messagesContainerElement.clientHeight + 5;
-							}}
+							class="h-10 shrink-0 flex items-center justify-between gap-2 border-b border-gray-50/80 px-3 text-gray-700 dark:border-gray-850/40 dark:text-gray-200"
 						>
-							<div class=" h-full w-full flex flex-col">
-								<Messages
-									chatId={$chatId}
-									bind:history
-									bind:autoScroll
-									bind:prompt
-									{selectedModels}
-									{sendPrompt}
-									{showMessage}
-									{submitMessage}
-									{continueResponse}
-									{regenerateResponse}
-									{mergeResponses}
-									{chatActionHandler}
-									{addMessages}
-									bottomPadding={files.length > 0}
+							<div class="flex min-w-0 items-center gap-2">
+								<EmbeddedChatHistoryDropdown
+									title={embeddedHeaderTitle}
+									chats={embeddedChats}
+									canCreateNew={!!onNewEmbeddedChat &&
+										Object.keys(history?.messages ?? {}).length > 0}
+									{loading}
+									onNewChat={onNewEmbeddedChat}
+									onSelectChat={onSelectEmbeddedChat}
+									onDeleteChat={onDeleteEmbeddedChat}
 								/>
 							</div>
-						</div>
-
-						<div class=" pb-[1rem]">
-							<MessageInput
-								{history}
-								{selectedModels}
-								bind:files
-								bind:prompt
-								bind:autoScroll
-								bind:selectedToolIds
-								bind:webSearchEnabled
-								bind:atSelectedModel
-								transparentBackground={$settings?.backgroundImageUrl ?? false}
-								{stopResponse}
-								{createMessagePair}
-								onChange={(input) => {
-									if (input.prompt) {
-										localStorage.setItem(`chat-input-${$chatId}`, JSON.stringify(input));
-									} else {
-										localStorage.removeItem(`chat-input-${$chatId}`);
-									}
-								}}
-								on:upload={async (e) => {
-									const { type, data } = e.detail;
-
-									if (type === 'web') {
-										await uploadWeb(data);
-									} else if (type === 'youtube') {
-										await uploadYoutubeTranscription(data);
-									} else if (type === 'google-drive') {
-										await uploadGoogleDriveFile(data);
-									}
-								}}
-								on:submit={async (e) => {
-									if (e.detail) {
-										await tick();
-										submitPrompt(
-											($settings?.richTextInput ?? true)
-												? e.detail.replaceAll('\n\n', '\n')
-												: e.detail
-										);
-									}
-								}}
-							/>
-
-							<div
-								class="absolute bottom-1 text-xs text-gray-500 text-center line-clamp-1 right-0 left-0"
-							>
-								<!-- {$i18n.t('LLMs can make mistakes. Verify important information.')} -->
-							</div>
+							<Tooltip content={$i18n.t('Close')} placement="bottom">
+								<button
+									type="button"
+									class="rounded-md p-1 text-gray-500 transition hover:text-gray-900 dark:hover:text-white"
+									on:click={() => onCloseEmbedded?.()}
+									aria-label={$i18n.t('Close')}
+								>
+									<XMark className="size-4" strokeWidth="2" />
+								</button>
+							</Tooltip>
 						</div>
 					{:else}
-						<div class="overflow-auto w-full h-full flex items-center">
-							<Placeholder
-								{history}
-								{selectedModels}
-								bind:files
-								bind:prompt
-								bind:autoScroll
-								bind:selectedToolIds
-								bind:webSearchEnabled
-								bind:atSelectedModel
-								transparentBackground={$settings?.backgroundImageUrl ?? false}
-								{stopResponse}
-								{createMessagePair}
-								on:upload={async (e) => {
-									const { type, data } = e.detail;
+						<Navbar
+							bind:this={navbarElement}
+							{readOnly}
+							chat={{
+								id: $chatId,
+								chat: {
+									title: $chatTitle,
+									models: selectedModels,
+									system: $settings.system ?? undefined,
+									params: params,
+									history: history,
+									timestamp: Date.now()
+								}
+							}}
+							{history}
+							title={$chatTitle}
+							shareEnabled={!!history.currentId}
+							{initNewChat}
+							scrollToTop={!isNearTop ? scrollToTop : null}
+							{archiveChatHandler}
+							{deleteChatHandler}
+							{moveChatHandler}
+							onSaveTempChat={async () => {
+								try {
+									if (!history?.currentId || !Object.keys(history.messages).length) {
+										toast.error($i18n.t('No conversation to save'));
+										return;
+									}
+									const messages = createMessagesList(history, history.currentId);
+									const title =
+										messages.find((m) => m.role === 'user')?.content ?? $i18n.t('New Chat');
 
-									if (type === 'web') {
-										await uploadWeb(data);
-									} else if (type === 'youtube') {
-										await uploadYoutubeTranscription(data);
+									const savedChat = await createNewChat(
+										localStorage.token,
+										{
+											id: uuidv4(),
+											title: title.length > 50 ? `${title.slice(0, 50)}...` : title,
+											models: selectedModels,
+											params: params,
+											history: history,
+											messages: messages,
+											timestamp: Date.now()
+										},
+										null,
+										chatVariables
+									);
+
+									if (savedChat) {
+										temporaryChatEnabled.set(false);
+										chatId.set(savedChat.id);
+										await refreshChatList(localStorage.token);
+
+										await goto(`/c/${savedChat.id}`);
+										toast.success($i18n.t('Conversation saved successfully'));
 									}
-								}}
-								on:submit={async (e) => {
-									if (e.detail) {
-										await tick();
-										submitPrompt(
-											($settings?.richTextInput ?? true)
-												? e.detail.replaceAll('\n\n', '\n')
-												: e.detail
-										);
-									}
-								}}
-							/>
-						</div>
+								} catch (error) {
+									console.error('Failed to save temporary chat:', error);
+									toast.error($i18n.t('Failed to save conversation'));
+								}
+							}}
+						/>
 					{/if}
-				</div>
-			</Pane>
+					<div id="chat-pane" class="flex flex-col flex-auto z-10 w-full @container overflow-auto">
+						{#if ($settings?.landingPageMode === 'chat' && !$selectedFolder) || createMessagesList(history, history.currentId).length > 0}
+							<div
+								class=" pb-2.5 flex flex-col justify-between w-full flex-auto overflow-auto h-0 max-w-full z-10 scrollbar-hidden"
+								id="messages-container"
+								bind:this={messagesContainerElement}
+								on:scroll={(e) => {
+									autoScroll =
+										messagesContainerElement.scrollHeight - messagesContainerElement.scrollTop <=
+										messagesContainerElement.clientHeight + 5;
+									isNearTop = messagesContainerElement.scrollTop <= 100;
+								}}
+							>
+								<div class=" h-full w-full flex flex-col">
+									<Messages
+										bind:this={messagesRef}
+										chatId={$chatId}
+										{readOnly}
+										bind:history
+										bind:autoScroll
+										bind:prompt
+										setInputText={(text) => {
+											messageInput?.setText(text);
+										}}
+										bind:selectedModels
+										{atSelectedModel}
+										className={embedded ? 'h-full flex pt-4' : 'h-full flex pt-18'}
+										{sendMessage}
+										{showMessage}
+										{submitMessage}
+										{continueResponse}
+										{regenerateResponse}
+										{mergeResponses}
+										{chatActionHandler}
+										{addMessages}
+										allowDelete={!(generating || taskIds?.length)}
+										forkHandler={handleForkChat}
+										topPadding={!embedded}
+										bottomPadding={files.length > 0}
+										{onSelect}
+										{onInsertToNote}
+									/>
+								</div>
+							</div>
 
-			<ChatControls
-				bind:this={controlPaneComponent}
-				bind:history
-				bind:chatFiles
-				bind:params
-				bind:files
-				bind:pane={controlPane}
-				chatId={$chatId}
-				modelId={selectedModelIds?.at(0) ?? null}
-				models={selectedModelIds.reduce((a, e, i, arr) => {
-					const model = $models.find((m) => m.id === e);
-					if (model) {
-						return [...a, model];
-					}
-					return a;
-				}, [])}
-				{submitPrompt}
-				{stopResponse}
-				{showMessage}
-				{eventTarget}
-			/>
-		</PaneGroup>
-	</div>
-{/if}
+							{#if readOnly}
+								<div class="pb-6 z-10">
+									<div class="text-xs text-gray-400 dark:text-gray-500 text-center">
+										{$i18n.t('Read only')}
+									</div>
+								</div>
+							{:else}
+								<div
+									id={embedded ? messageInputDropzoneId : undefined}
+									class=" pb-2 {dragged ? 'z-0' : 'z-10'}"
+								>
+									<MessageInput
+										bind:this={messageInput}
+										{history}
+										{taskIds}
+										bind:selectedModels
+										bind:files
+										bind:prompt
+										bind:autoScroll
+										bind:selectedToolIds
+										bind:selectedSkillIds
+										bind:selectedFilterIds
+										bind:imageGenerationEnabled
+										bind:codeInterpreterEnabled
+										{pendingOAuthTools}
+										bind:webSearchEnabled
+										bind:atSelectedModel
+										bind:showCommands
+										bind:dragged
+										dropzoneId={messageInputDropzoneId}
+										chatId={$chatId}
+										{contextUsage}
+										{contextCompactionEnabled}
+										compactHandler={handleManualCompact}
+										statusHandler={handleStatusCommand}
+										forkHandler={handleForkChat}
+										toolServers={$toolServers}
+										{generating}
+										{stopResponse}
+										{createMessagePair}
+										{onUpload}
+										messageQueue={$chatRequestQueues[$chatId] ?? []}
+										{chatTasks}
+										onQueueSendNow={async (id) => {
+											const queue = $chatRequestQueues[$chatId] ?? [];
+											const item = queue.find((m) => m.id === id);
+											if (item) {
+												// Remove from queue
+												chatRequestQueues.update((q) => ({
+													...q,
+													[$chatId]: queue.filter((m) => m.id !== id)
+												}));
+												await stopResponse(false);
+												await tick();
+												await submitPrompt(item.prompt, item.files);
+											}
+										}}
+										onQueueEdit={(id) => {
+											const queue = $chatRequestQueues[$chatId] ?? [];
+											const item = queue.find((m) => m.id === id);
+											if (item) {
+												// Remove from queue
+												chatRequestQueues.update((q) => ({
+													...q,
+													[$chatId]: queue.filter((m) => m.id !== id)
+												}));
+												// Set files and restore prompt to input
+												files = item.files;
+												messageInput?.setText(item.prompt);
+											}
+										}}
+										onQueueDelete={(id) => {
+											const queue = $chatRequestQueues[$chatId] ?? [];
+											chatRequestQueues.update((q) => ({
+												...q,
+												[$chatId]: queue.filter((m) => m.id !== id)
+											}));
+										}}
+										onChange={(data) => {
+											if (!$temporaryChatEnabled) {
+												saveDraft(data, $chatId);
+											}
+										}}
+										onWebSearchToggle={handleWebSearchToggle}
+										on:chatVariables={() => {
+											showChatVariablesModal = true;
+										}}
+										on:submit={async (e) => {
+											clearDraft($chatId);
+											if (e.detail || files.length > 0) {
+												await tick();
+
+												submitHandler(withSelectedText(e.detail));
+											}
+										}}
+									/>
+
+									<div
+										class="absolute bottom-1 text-xs text-gray-500 text-center line-clamp-1 right-0 left-0"
+									>
+										<!-- {$i18n.t('LLMs can make mistakes. Verify important information.')} -->
+									</div>
+								</div>
+							{/if}
+						{:else if embedded}
+							<div class="flex h-full min-h-0 flex-col justify-end">
+								{#if suggestedPrompts.length > 0}
+									<div class="flex flex-1 items-end px-5 pb-8">
+										<div class="w-full">
+											<div class="mb-2 text-[12px] text-gray-300 dark:text-gray-700">
+												{$i18n.t('Suggested prompts')}
+											</div>
+											<div class="flex flex-col">
+												{#each suggestedPrompts as suggestion}
+													<button
+														type="button"
+														class="flex min-h-8 w-full items-center justify-between py-1 text-left text-[13px] leading-5 text-gray-500 transition hover:text-gray-700 dark:text-gray-500 dark:hover:text-gray-300"
+														on:click={async () => {
+															await tick();
+															await submitHandler(withSelectedText(suggestion));
+														}}
+													>
+														<span class="min-w-0 truncate">{suggestion}</span>
+													</button>
+												{/each}
+											</div>
+										</div>
+									</div>
+								{/if}
+								<div id={embedded ? messageInputDropzoneId : undefined} class="pb-2 z-10">
+									<MessageInput
+										bind:this={messageInput}
+										{history}
+										{taskIds}
+										bind:selectedModels
+										bind:files
+										bind:prompt
+										bind:autoScroll
+										bind:selectedToolIds
+										bind:selectedSkillIds
+										bind:selectedFilterIds
+										bind:imageGenerationEnabled
+										bind:codeInterpreterEnabled
+										{pendingOAuthTools}
+										bind:webSearchEnabled
+										bind:atSelectedModel
+										bind:showCommands
+										bind:dragged
+										dropzoneId={messageInputDropzoneId}
+										chatId={$chatId}
+										{contextUsage}
+										{contextCompactionEnabled}
+										compactHandler={handleManualCompact}
+										statusHandler={handleStatusCommand}
+										forkHandler={handleForkChat}
+										toolServers={$toolServers}
+										{generating}
+										{stopResponse}
+										{createMessagePair}
+										{onUpload}
+										messageQueue={$chatRequestQueues[$chatId] ?? []}
+										{chatTasks}
+										onWebSearchToggle={handleWebSearchToggle}
+										on:chatVariables={() => {
+											showChatVariablesModal = true;
+										}}
+										on:submit={async (e) => {
+											clearDraft($chatId);
+											if (e.detail || files.length > 0) {
+												await tick();
+												submitHandler(withSelectedText(e.detail));
+											}
+										}}
+									/>
+								</div>
+							</div>
+						{:else}
+							<div class="flex items-center h-full">
+								<Placeholder
+									{history}
+									bind:selectedModels
+									bind:messageInput
+									bind:files
+									bind:prompt
+									bind:autoScroll
+									bind:selectedToolIds
+									bind:selectedSkillIds
+									bind:selectedFilterIds
+									bind:imageGenerationEnabled
+									bind:codeInterpreterEnabled
+									bind:webSearchEnabled
+									bind:atSelectedModel
+									bind:showCommands
+									bind:dragged
+									{pendingOAuthTools}
+									toolServers={$toolServers}
+									{stopResponse}
+									{createMessagePair}
+									{onSelect}
+									{onUpload}
+									onWebSearchToggle={handleWebSearchToggle}
+									on:chatVariables={() => {
+										showChatVariablesModal = true;
+									}}
+									onChange={(data) => {
+										if (!$temporaryChatEnabled) {
+											saveDraft(data);
+										}
+									}}
+									on:submit={async (e) => {
+										clearDraft();
+										if (e.detail || files.length > 0) {
+											await tick();
+											submitHandler(withSelectedText(e.detail));
+										}
+									}}
+								/>
+							</div>
+						{/if}
+					</div>
+				</Pane>
+
+				{#if !embedded}
+					<ChatControls
+						bind:this={controlPaneComponent}
+						bind:history
+						bind:chatFiles
+						bind:params
+						bind:files
+						bind:pane={controlPane}
+						chatId={$chatId}
+						modelId={selectedModelIds?.at(0) ?? null}
+						models={selectedModelIds.reduce((a, e, i, arr) => {
+							const model = $models.find((m) => m.id === e);
+							if (model) {
+								return [...a, model];
+							}
+							return a;
+						}, [])}
+						submitPrompt={submitHandler}
+						{stopResponse}
+						{showMessage}
+						{eventTarget}
+						{codeInterpreterEnabled}
+						containerId={chatContainerId}
+					/>
+				{/if}
+			</PaneGroup>
+		</div>
+	{:else if loading}
+		<div class=" flex items-center justify-center h-full w-full">
+			<div class="m-auto">
+				<Spinner className="size-5" />
+			</div>
+		</div>
+	{/if}
+</div>
+
+<style>
+	::-webkit-scrollbar {
+		height: 0.5rem;
+		width: 0.5rem;
+	}
+</style>

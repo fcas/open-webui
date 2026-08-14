@@ -4,6 +4,7 @@
 	import Modal from '$lib/components/common/Modal.svelte';
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import Badge from '$lib/components/common/Badge.svelte';
+	import XMark from '$lib/components/icons/XMark.svelte';
 	const i18n = getContext('i18n');
 
 	export let show = false;
@@ -12,8 +13,8 @@
 
 <Modal size="lg" bind:show>
 	<div>
-		<div class="flex justify-between dark:text-gray-300 px-5 pt-4 pb-2">
-			<div class="text-lg font-medium self-center flex flex-col gap-0.5 capitalize">
+		<div class="flex justify-between dark:text-gray-300 px-4 pt-3 pb-1">
+			<div class="text-sm font-medium self-center flex flex-col gap-0.5 capitalize">
 				{#if codeExecution?.result}
 					<div>
 						{#if codeExecution.result?.error}
@@ -43,22 +44,13 @@
 				</div>
 			</div>
 			<button
-				class="self-center"
+				class="self-center rounded-lg p-1 text-gray-500 transition hover:bg-gray-50 hover:text-gray-700 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200"
 				on:click={() => {
 					show = false;
 					codeExecution = null;
 				}}
 			>
-				<svg
-					xmlns="http://www.w3.org/2000/svg"
-					viewBox="0 0 20 20"
-					fill="currentColor"
-					class="w-5 h-5"
-				>
-					<path
-						d="M6.28 5.22a.75.75 0 00-1.06 1.06L8.94 10l-3.72 3.72a.75.75 0 101.06 1.06L10 11.06l3.72 3.72a.75.75 0 101.06-1.06L11.06 10l3.72-3.72a.75.75 0 00-1.06-1.06L10 8.94 6.28 5.22z"
-					/>
-				</svg>
+				<XMark className={'size-4'} />
 			</button>
 		</div>
 
@@ -76,7 +68,6 @@
 						(codeExecution?.result?.error || codeExecution?.result?.output)
 							? 'rounded-b-none'
 							: ''}
-						stickyButtonsClassName="top-0"
 						run={false}
 					/>
 				</div>
@@ -99,8 +90,8 @@
 				{/if}
 				{#if codeExecution?.result?.files && codeExecution?.result?.files.length > 0}
 					<div class="flex flex-col w-full">
-						<hr class=" dark:border-gray-850 my-2" />
-						<div class=" text-sm font-medium dark:text-gray-300">
+						<hr class="border-gray-100/30 dark:border-gray-850/30 my-2" />
+						<div class=" text-sm font-normal dark:text-gray-300">
 							{$i18n.t('Files')}
 						</div>
 						<ul class="mt-1 list-disc pl-4 text-xs">

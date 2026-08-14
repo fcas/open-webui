@@ -37,9 +37,9 @@
 			name: data.name,
 			meta: data.meta,
 			content: data.content,
-			access_control: data.access_control
+			access_grants: data.access_grants
 		}).catch((error) => {
-			toast.error(error);
+			toast.error(`${error}`);
 			return null;
 		});
 
@@ -56,33 +56,44 @@
 		const id = $page.url.searchParams.get('id');
 
 		if (id) {
-			tool = await getToolById(localStorage.token, id).catch((error) => {
-				toast.error(error);
+			const res = await getToolById(localStorage.token, id).catch((error) => {
+				toast.error(`${error}`);
 				goto('/workspace/tools');
 				return null;
 			});
 
-			console.log(tool);
+			if (res && !res.write_access) {
+				toast.error($i18n.t('You do not have permission to edit this tool'));
+				goto('/workspace/tools');
+				return;
+			}
+
+			if (res) {
+				tool = res;
+				console.log(tool);
+			}
 		}
 	});
 </script>
 
 {#if tool}
-	<ToolkitEditor
-		edit={true}
-		id={tool.id}
-		name={tool.name}
-		meta={tool.meta}
-		content={tool.content}
-		accessControl={tool.access_control}
-		on:save={(e) => {
-			saveHandler(e.detail);
-		}}
-	/>
+	<div class="h-full min-w-0 overflow-x-hidden">
+		<ToolkitEditor
+			edit={true}
+			id={tool.id}
+			name={tool.name}
+			meta={tool.meta}
+			content={tool.content}
+			accessGrants={tool.access_grants ?? []}
+			onSave={(value) => {
+				saveHandler(value);
+			}}
+		/>
+	</div>
 {:else}
 	<div class="flex items-center justify-center h-full">
 		<div class=" pb-16">
-			<Spinner />
+			<Spinner className="size-5" />
 		</div>
 	</div>
 {/if}

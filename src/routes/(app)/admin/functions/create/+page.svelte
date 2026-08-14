@@ -3,7 +3,7 @@
 	import { onMount, getContext } from 'svelte';
 	import { goto } from '$app/navigation';
 
-	import { functions, models } from '$lib/stores';
+	import { config, functions, models, settings } from '$lib/stores';
 	import { createNewFunction, getFunctions } from '$lib/apis/functions';
 	import FunctionEditor from '$lib/components/admin/Functions/FunctionEditor.svelte';
 	import { getModels } from '$lib/apis';
@@ -40,20 +40,32 @@
 			meta: data.meta,
 			content: data.content
 		}).catch((error) => {
-			toast.error(error);
+			toast.error(`${error}`);
 			return null;
 		});
 
 		if (res) {
 			toast.success($i18n.t('Function created successfully'));
 			functions.set(await getFunctions(localStorage.token));
-			models.set(await getModels(localStorage.token));
+			models.set(
+				await getModels(
+					localStorage.token,
+					$config?.features?.enable_direct_connections && ($settings?.directConnections ?? null),
+					false,
+					true
+				)
+			);
 
 			await goto('/admin/functions');
 		}
 	};
 
 	onMount(() => {
+		if (!$config?.features?.enable_plugins) {
+			goto('/admin', { replaceState: true });
+			return;
+		}
+
 		window.addEventListener('message', async (event) => {
 			if (
 				!['https://openwebui.com', 'https://www.openwebui.com', 'http://localhost:9999'].includes(
@@ -84,15 +96,17 @@
 
 {#if mounted}
 	{#key func?.content}
-		<FunctionEditor
-			id={func?.id ?? ''}
-			name={func?.name ?? ''}
-			meta={func?.meta ?? { description: '' }}
-			content={func?.content ?? ''}
-			{clone}
-			on:save={(e) => {
-				saveHandler(e.detail);
-			}}
-		/>
+		<div class="px-[16px] h-full min-w-0 overflow-x-hidden">
+			<FunctionEditor
+				id={func?.id ?? ''}
+				name={func?.name ?? ''}
+				meta={func?.meta ?? { description: '' }}
+				content={func?.content ?? ''}
+				{clone}
+				onSave={(value) => {
+					saveHandler(value);
+				}}
+			/>
+		</div>
 	{/key}
 {/if}
